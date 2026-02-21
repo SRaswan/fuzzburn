@@ -1,0 +1,28 @@
+[package]
+name = "fuzzburn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fuzzburn = { path = ".." }
+
+# Two fuzz targets:
+#   cargo fuzz run fuzz_tensor_ops   – frontend tensor op fuzzing
+#   cargo fuzz run fuzz_autograd     – autograd / backward-pass fuzzing
+
+[[bin]]
+name = "fuzz_tensor_ops"
+path = "fuzz_tensor_ops.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_autograd"
+path = "fuzz_autograd.rs"
+test = false
+doc = false

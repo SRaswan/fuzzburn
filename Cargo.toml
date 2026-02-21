@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 burn = { version = "0.16", features = ["autodiff", "ndarray"] }
+arbitrary = { version = "1", features = ["derive"] }

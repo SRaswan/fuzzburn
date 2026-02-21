@@ -15,5 +15,5 @@ fn main() {
     let x_grad = x.grad(&grads).unwrap();
 
     println!("y = x^2,  x = 2.0");
-    println!("dy/dx = {:?}", x_grad.into_data()); // expected: 4.0
+    println!("dy/dx = {}", x_grad.into_data()); // expected: 4.0
 }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["oracle-tch"]
 oracle-tch = ["burn/tch"]
 
 [dependencies]
@@ -11,3 +12,4 @@ burn = { version = "0.20.1", features = ["autodiff", "ndarray", "tch"] }
 arbitrary = { version = "1.3", features = ["derive"] }
 tch = "0.22.0"
 torch-sys = "0.22.0"  
+burn-ir = "0.20.1"

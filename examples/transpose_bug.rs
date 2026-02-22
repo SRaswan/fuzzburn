@@ -9,7 +9,7 @@ fn run<B: AutodiffBackend<FloatElem = f32>>(device: &B::Device, label: &str) {
     let x_0: Tensor<B, 2> = Tensor::full([3, 3], 0.5_f32, device).require_grad();
 
     let t0 = x_0.clone();
-    let t1 = t0.clone();
+    let t1 = t0.clone() + t0.transpose();
     let t2 = t1.log();
     let grads = t2.backward();
 

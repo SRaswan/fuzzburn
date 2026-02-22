@@ -86,38 +86,10 @@ impl Shape2 {
     /// Given a DiffOp, compute the output shape.  Returns `None` for `Leaf`
     /// (handled by the main loop).
     fn after_diff_op(shapes: &[Shape2], op: &DiffOp) -> Option<Shape2> {
-        let n = shapes.len();
-        Some(match op {
-            DiffOp::Leaf(_) => return None,
-            DiffOp::Add(a, b)
-            | DiffOp::Sub(a, b)
-            | DiffOp::Mul(a, b) => {
-                let sa = shapes[a.resolve(n)];
-                let sb = shapes[resolve_broadcast_compatible(shapes, a.resolve(n), b)];
-                sa.broadcast_result(sb)
-            }
-            DiffOp::Matmul(a, b) => {
-                let sa = shapes[a.resolve(n)];
-                match resolve_matmul_compatible(shapes, a.resolve(n), b) {
-                    Some(bi) => Shape2(sa.0, shapes[bi].1),
-                    None => sa, // demoted to passthrough
-                }
-            }
-            DiffOp::Neg(r)
-            | DiffOp::Abs(r)
-            | DiffOp::Exp(r)
-            | DiffOp::Log(r)
-            | DiffOp::Sqrt(r)
-            | DiffOp::Relu(r)
-            | DiffOp::Sigmoid(r)
-            | DiffOp::Tanh(r)
-            | DiffOp::Clamp(r) => shapes[r.resolve(n)],
-            DiffOp::SumAll(_) | DiffOp::MeanAll(_) => Shape2(1, 1),
-            DiffOp::Transpose(r) => {
-                let Shape2(r_, c_) = shapes[r.resolve(n)];
-                Shape2(c_, r_)
-            }
-        })
+        match op {
+            DiffOp::Leaf { .. } => None,
+            DiffOp::Instr(instr) => Some(Shape2::after_tensor_instr(shapes, instr)),
+        }
     }
 }
 
@@ -342,27 +314,21 @@ fn eval_tensor_instr<B: Backend>(
     }
 }
 
-/// Run a plain SSA TensorProgram against NdArray.
-pub fn run_tensor_program(prog: &TensorProgram) -> Result<(), String> {
-    catch_as_result(std::panic::AssertUnwindSafe(|| {
-        run_tensor_program_inner(prog);
-    }))
-}
-
-fn run_tensor_program_inner(prog: &TensorProgram) {
+/// Run a plain SSA TensorProgram on any backend, returning the final
+/// register's data as `Vec<f32>` (mirrors the `collect_grads` pattern).
+fn eval_tensor_program<B: Backend>(prog: &TensorProgram, device: &B::Device) -> Vec<f32> {
     let rows = (prog.rows as usize).clamp(1, 16);
     let cols = (prog.cols as usize).clamp(1, 16);
-    let device = NdArrayDevice::default();
 
     // r0 = initial tensor
-    let r0: Tensor<PlainB, 2> =
-        Tensor::<PlainB, 1>::from_floats(
+    let r0: Tensor<B, 2> =
+        Tensor::<B, 1>::from_floats(
             bytes_to_floats(&prog.values, rows * cols).as_slice(),
-            &device,
+            device,
         )
         .reshape([rows, cols]);
 
-    let mut regs: Vec<Tensor<PlainB, 2>> = vec![r0];
+    let mut regs: Vec<Tensor<B, 2>> = vec![r0];
     let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
 
     for instr in &prog.ops {
@@ -372,10 +338,27 @@ fn run_tensor_program_inner(prog: &TensorProgram) {
         shapes.push(out_shape);
     }
 
-    // force evaluation of the last register
-    if let Some(last) = regs.pop() {
-        let _ = last.into_data();
-    }
+    regs.pop()
+        .expect("register file is empty")
+        .into_data()
+        .to_vec::<f32>()
+        .expect("into_data failed")
+}
+
+/// Run a plain SSA TensorProgram against NdArray (+ LibTorch oracle when enabled).
+pub fn run_tensor_program(prog: &TensorProgram) -> Result<(), String> {
+    catch_as_result(std::panic::AssertUnwindSafe(|| {
+        let nd = eval_tensor_program::<PlainB>(prog, &NdArrayDevice::default());
+        #[cfg(feature = "oracle-tch")]
+        run_tensor_program_oracle(prog, nd);
+    }))
+}
+
+/// Compare tensor-program outputs between NdArray and LibTorch.
+#[cfg(feature = "oracle-tch")]
+fn run_tensor_program_oracle(prog: &TensorProgram, nd: Vec<f32>) {
+    let lt = eval_tensor_program::<LibTorch>(prog, &LibTorchDevice::Cpu);
+    compare_outputs(&nd, &lt, "tensor_program");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -399,44 +382,10 @@ fn eval_diff_op<AB: AutodiffBackend>(
     shapes: &[Shape2],
     op: &DiffOp,
 ) -> Option<Tensor<AB, 2>> {
-    let n = regs.len();
-    Some(match op {
-        DiffOp::Leaf(_) => return None,
-        DiffOp::Add(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() + regs[bi].clone()
-        }
-        DiffOp::Sub(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() - regs[bi].clone()
-        }
-        DiffOp::Mul(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() * regs[bi].clone()
-        }
-        DiffOp::Matmul(a, b) => {
-            let ai = a.resolve(n);
-            match resolve_matmul_compatible(shapes, ai, b) {
-                Some(bi) => regs[ai].clone().matmul(regs[bi].clone()),
-                None => regs[ai].clone(), // no valid partner → passthrough
-            }
-        }
-        DiffOp::Neg(r)        => regs[r.resolve(n)].clone().neg(),
-        DiffOp::Abs(r)        => regs[r.resolve(n)].clone().abs(),
-        DiffOp::Exp(r)        => regs[r.resolve(n)].clone().exp(),
-        DiffOp::Log(r)        => regs[r.resolve(n)].clone().log(),
-        DiffOp::Sqrt(r)       => regs[r.resolve(n)].clone().sqrt(),
-        DiffOp::Relu(r)       => activation::relu(regs[r.resolve(n)].clone()),
-        DiffOp::Sigmoid(r)    => activation::sigmoid(regs[r.resolve(n)].clone()),
-        DiffOp::Tanh(r)       => activation::tanh(regs[r.resolve(n)].clone()),
-        DiffOp::SumAll(r)     => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
-        DiffOp::MeanAll(r)    => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
-        DiffOp::Transpose(r)  => regs[r.resolve(n)].clone().transpose(),
-        DiffOp::Clamp(r)      => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
-    })
+    match op {
+        DiffOp::Leaf { .. } => None,
+        DiffOp::Instr(instr) => Some(eval_tensor_instr(regs, shapes, instr)),
+    }
 }
 
 /// Run `prog` on any autodiff backend, returning gradient data for every leaf
@@ -459,29 +408,33 @@ fn collect_grads<AB: AutodiffBackend>(
     let mut regs: Vec<Tensor<AB, 2>> = vec![leaf_0];
     let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
     let mut leaf_indices: Vec<usize> = vec![0]; // register indices that are leaves
+    let mut leaf_shapes: Vec<(usize, usize)> = vec![(rows, cols)]; // per-leaf sizes
     let mut leaf_count: usize = 1;
 
     for op in &prog.ops {
         let (val, out_shape) = match op {
-            DiffOp::Leaf(seed_idx) => {
+            DiffOp::Leaf { seed, rows: lr, cols: lc } => {
                 if leaf_count < config.max_leaves {
                     let pool_idx = if prog.leaf_seeds.is_empty() {
                         0
                     } else {
-                        *seed_idx as usize % prog.leaf_seeds.len()
+                        *seed as usize % prog.leaf_seeds.len()
                     };
                     let raw = prog
                         .leaf_seeds
                         .get(pool_idx)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let leaf = make_leaf::<AB>(raw, rows, cols, device);
+                    let leaf_rows = (*lr as usize).clamp(1, 16);
+                    let leaf_cols = (*lc as usize).clamp(1, 16);
+                    let leaf = make_leaf::<AB>(raw, leaf_rows, leaf_cols, device);
                     leaf_indices.push(regs.len()); // index of the *next* push
+                    leaf_shapes.push((leaf_rows, leaf_cols));
                     leaf_count += 1;
-                    (leaf, Shape2(rows, cols))
+                    (leaf, Shape2(leaf_rows, leaf_cols))
                 } else {
                     // Cap reached: alias an existing register
-                    let alias_idx = (*seed_idx as usize) % regs.len();
+                    let alias_idx = (*seed as usize) % regs.len();
                     (regs[alias_idx].clone(), shapes[alias_idx])
                 }
             }
@@ -503,14 +456,15 @@ fn collect_grads<AB: AutodiffBackend>(
 
     leaf_indices
         .iter()
-        .map(|&ri| {
+        .zip(leaf_shapes.iter())
+        .map(|(&ri, &(lr, lc))| {
             match regs[ri].grad(&grads) {
                 Some(g) => g
                     .into_data()
                     .to_vec::<f32>()
                     .unwrap_or_else(|e| panic!("into_data for r{ri} grad failed: {e}")),
                 // Leaf not reachable from the backward root → zero gradient
-                None => vec![0.0_f32; rows * cols],
+                None => vec![0.0_f32; lr * lc],
             }
         })
         .collect()

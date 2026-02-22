@@ -151,25 +151,26 @@ impl AutogradProgram {
         for op in &self.ops {
             let out = format!("r{}", num_regs);
             match op {
-                DiffOp::Leaf(seed_idx) => {
+                DiffOp::Leaf { seed, rows: lr, cols: lc } => {
                     if leaf_count < max_leaves {
                         let pool_idx = if self.leaf_seeds.is_empty() {
                             0
                         } else {
-                            *seed_idx as usize % self.leaf_seeds.len()
+                            *seed as usize % self.leaf_seeds.len()
                         };
                         let seed_len =
                             self.leaf_seeds.get(pool_idx).map(|v| v.len()).unwrap_or(0);
+                        let leaf_rows = (*lr as usize).clamp(1, 16);
+                        let leaf_cols = (*lc as usize).clamp(1, 16);
                         let _ = writeln!(
                             s,
-                            "{out} = leaf({}×{}, {seed_len} seed bytes)  \
+                            "{out} = leaf({leaf_rows}×{leaf_cols}, {seed_len} seed bytes)  \
                              [requires_grad, leaf #{leaf_count}]",
-                            rows, cols
                         );
                         leaf_reg_indices.push(num_regs);
                         leaf_count += 1;
                     } else {
-                        let src = (*seed_idx as usize) % num_regs;
+                        let src = (*seed as usize) % num_regs;
                         let _ = writeln!(
                             s,
                             "{out} = r{src}  # leaf cap reached, alias"

@@ -147,37 +147,20 @@ impl TensorInstr {
 
 /// SSA instruction for autograd programs.
 ///
-/// `Leaf(u8)` introduces a new `requires_grad` input tensor (the `u8` selects
-/// seed data from the seed pool, or aliases a register when `max_leaves` is
-/// reached).  All other variants consume register operands and produce a new
-/// register value.
+/// `Leaf { seed, rows, cols }` introduces a new `requires_grad` input tensor
+/// with its own shape.  The `seed` byte selects data from the seed pool (or
+/// aliases a register when `max_leaves` is reached).  `Instr` wraps a
+/// [`TensorInstr`] — all the same ops, no duplication.
 #[derive(Arbitrary, Debug, Clone)]
 pub enum DiffOp {
-    /// Introduce a new leaf input.
-    Leaf(u8),
-    // --- binary: result = reg ⊕ reg ---
-    Add(Reg, Reg),
-    Sub(Reg, Reg),
-    Mul(Reg, Reg),
-    // --- unary ---
-    Neg(Reg),
-    Abs(Reg),
-    Exp(Reg),
-    Log(Reg),
-    Sqrt(Reg),
-    // --- activations ---
-    Relu(Reg),
-    Sigmoid(Reg),
-    Tanh(Reg),
-    // --- reductions ---
-    SumAll(Reg),
-    MeanAll(Reg),
-    // --- layout ---
-    Transpose(Reg),
-    // --- matmul ---
-    Matmul(Reg, Reg),
-    // --- guard ---
-    Clamp(Reg),
+    /// Introduce a new leaf input with its own shape.
+    Leaf {
+        seed: u8,
+        rows: u8,
+        cols: u8,
+    },
+    /// Any tensor instruction (shared with plain-tensor programs).
+    Instr(TensorInstr),
 }
 
 impl DiffOp {
@@ -186,23 +169,12 @@ impl DiffOp {
     /// For `Leaf`, a placeholder is printed; callers should override.
     pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {
         match self {
-            DiffOp::Leaf(_)       => format!("{out} = leaf()  [requires_grad]"),
-            DiffOp::Add(a, b)     => format!("{out} = {} + {}", a.name(num_regs), b.name(num_regs)),
-            DiffOp::Sub(a, b)     => format!("{out} = {} - {}", a.name(num_regs), b.name(num_regs)),
-            DiffOp::Mul(a, b)     => format!("{out} = {} * {}", a.name(num_regs), b.name(num_regs)),
-            DiffOp::Neg(r)        => format!("{out} = -{}", r.name(num_regs)),
-            DiffOp::Abs(r)        => format!("{out} = abs({})", r.name(num_regs)),
-            DiffOp::Exp(r)        => format!("{out} = exp({})", r.name(num_regs)),
-            DiffOp::Log(r)        => format!("{out} = log({})", r.name(num_regs)),
-            DiffOp::Sqrt(r)       => format!("{out} = sqrt({})", r.name(num_regs)),
-            DiffOp::Relu(r)       => format!("{out} = relu({})", r.name(num_regs)),
-            DiffOp::Sigmoid(r)    => format!("{out} = sigmoid({})", r.name(num_regs)),
-            DiffOp::Tanh(r)       => format!("{out} = tanh({})", r.name(num_regs)),
-            DiffOp::SumAll(r)     => format!("{out} = sum({})  # → [1,1]", r.name(num_regs)),
-            DiffOp::MeanAll(r)    => format!("{out} = mean({})  # → [1,1]", r.name(num_regs)),
-            DiffOp::Transpose(r)  => format!("{out} = {}.T", r.name(num_regs)),
-            DiffOp::Matmul(a, b)  => format!("{out} = {} @ {}", a.name(num_regs), b.name(num_regs)),
-            DiffOp::Clamp(r)      => format!("{out} = clamp({}, -1e6, 1e6)", r.name(num_regs)),
+            DiffOp::Leaf { rows, cols, .. } => {
+                let r = (*rows as usize).clamp(1, 16);
+                let c = (*cols as usize).clamp(1, 16);
+                format!("{out} = leaf({r}×{c})  [requires_grad]")
+            }
+            DiffOp::Instr(i) => i.ssa_line(out, num_regs),
         }
     }
 }

@@ -10,11 +10,21 @@
 
 #![no_main]
 
-use fuzzburn::ir::{interpreter, program::AutogradProgram, FuzzConfig};
+use fuzzburn::ir::{interpreter, program::AutogradProgram, FuzzConfig, HarnessMode};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|prog: AutogradProgram| {
     let config = FuzzConfig::from_env();
-    println!("=== Fuzz input (max_leaves={}) ===\n{}", config.max_leaves, prog.ssa(config.max_leaves));
-    interpreter::run_autograd_program(&prog, &config);
+    if prog.ops.len() < config.min_ops { return; }
+    if let Err(msg) = interpreter::run_autograd_program(&prog, &config) {
+        let display = prog.ssa(config.max_leaves);
+        match config.mode {
+            HarnessMode::PanicOnFirstError => {
+                panic!("fuzz_autograd CRASH:\n{display}\nerror: {msg}");
+            }
+            HarnessMode::Continuous => {
+                eprintln!("\n=== CRASH (fuzz_autograd, continuing) ===\n{display}\nerror: {msg}\n");
+            }
+        }
+    }
 });

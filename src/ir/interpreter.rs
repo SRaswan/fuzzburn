@@ -1,6 +1,9 @@
 // IR interpreter – walks SSA programs using a register-file architecture.
+//
+// All public entry-points return `Result<(), String>`.  The fuzz target
+// decides what to do: in `PanicOnFirstError` mode it panics (so libFuzzer
+// saves the crash artifact), in `Continuous` it logs to stderr and moves on.
 
-use std::panic;
 use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::{Autodiff, NdArray};
 use burn::tensor::{activation, Tensor};
@@ -12,7 +15,7 @@ use burn::backend::LibTorch;
 use burn::backend::libtorch::LibTorchDevice;
 
 use super::ops::{DiffOp, TensorOp, TensorInstr};
-use super::program::{AutogradProgram, FuzzConfig, HarnessMode, SingleOpCase, TensorProgram};
+use super::program::{AutogradProgram, FuzzConfig, SingleOpCase, TensorProgram};
 
 type PlainB = NdArray;
 type DiffB = Autodiff<NdArray>;
@@ -27,16 +30,23 @@ fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// - `PanicOnFirstError` -> resume unwind and libFuzzer records crash
-/// - `Continuous`        -> log to stderr and return (fuzzer keeps running)
-pub fn handle_crash(e: Box<dyn std::any::Any + Send>, display: &str, target: &str, mode: HarnessMode) {
-    eprintln!("\n=== CRASH DETECTED ({target}) ===");
-    eprintln!("{display}");
-    eprintln!("========================================\n");
-    match mode {
-        HarnessMode::PanicOnFirstError => panic::resume_unwind(e),
-        HarnessMode::Continuous => { println!("Continuing fuzzing despite the crash..."); }
-    }
+/// Wrap a closure that may panic, converting the panic into `Err(String)`.
+/// This swaps in a no-op panic hook so libfuzzer's aborting hook doesn't
+/// kill us, then restores the original hook afterwards.
+fn catch_as_result<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> Result<(), String> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev);
+    result.map_err(|e| {
+        if let Some(s) = e.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<unknown panic payload>".to_string()
+        }
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -72,16 +82,12 @@ fn apply_tensor_op<B: Backend>(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>, op: &Tensor
 
 // SingleOP Interpreter
 // ───────────────────────────────────────────────────────────────────
-pub fn run_single_op_case(case: &SingleOpCase, mode: HarnessMode) {
-    let display = case.to_string();
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+pub fn run_single_op_case(case: &SingleOpCase) -> Result<(), String> {
+    catch_as_result(std::panic::AssertUnwindSafe(|| {
         run_single_op_case_inner(case);
         #[cfg(feature = "oracle-tch")]
         run_single_op_oracle(case);
-    }));
-    if let Err(e) = result {
-        handle_crash(e, &display, "fuzz_tensor_ops", mode);
-    }
+    }))
 }
 
 fn run_single_op_case_inner(case: &SingleOpCase) {
@@ -119,7 +125,7 @@ fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str){
         let abs_diff = (a - b).abs();
         let scale    = a.abs().max(b.abs()).max(1.0_f32);
         if abs_diff > 1e-4_f32 * scale {
-            eprintln!("oracle mismatch [{i}]: NdArray={a}, LibTorch={b}  ({label})");
+            // eprintln!("oracle mismatch [{i}]: NdArray={a}, LibTorch={b}  ({label})");
             mismatches += 1;
         }
     }
@@ -172,14 +178,10 @@ fn eval_tensor_instr<B: Backend>(regs: &[Tensor<B, 2>], instr: &TensorInstr) -> 
 }
 
 /// Run a plain SSA TensorProgram against NdArray.
-pub fn run_tensor_program(prog: &TensorProgram, mode: HarnessMode) {
-    let display = prog.to_string();
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+pub fn run_tensor_program(prog: &TensorProgram) -> Result<(), String> {
+    catch_as_result(std::panic::AssertUnwindSafe(|| {
         run_tensor_program_inner(prog);
-    }));
-    if let Err(e) = result {
-        handle_crash(e, &display, "fuzz_tensor_ops", mode);
-    }
+    }))
 }
 
 fn run_tensor_program_inner(prog: &TensorProgram) {
@@ -316,17 +318,12 @@ fn collect_grads<AB: AutodiffBackend>(
 }
 
 /// Run AutogradProgram against Autodiff<NdArray> backend.
-pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) {
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) -> Result<(), String> {
+    catch_as_result(std::panic::AssertUnwindSafe(|| {
         let nd = collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
         #[cfg(feature = "oracle-tch")]
         run_autograd_oracle(prog, config, nd);
-    }));
-            println!("Autograd program ran successfully withleaf(ves)");
-
-    if let Err(e) = result {
-        handle_crash(e, &prog.ssa(config.max_leaves), "fuzz_autograd", config.mode);
-    }
+    }))
 }
 
 // ─── autograd oracle (feature = "oracle-tch") ─────────────────────────────────

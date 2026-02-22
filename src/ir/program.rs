@@ -16,12 +16,14 @@ pub enum HarnessMode {
 pub struct FuzzConfig {
     /// Upper bound on the number of distinct leaf tensors that may be introduced
     pub max_leaves: usize,
+    /// Minimum number of ops a program must have; smaller inputs are skipped.
+    pub min_ops: usize,
     pub mode: HarnessMode,
 }
 
 impl Default for FuzzConfig {
     fn default() -> Self {
-        FuzzConfig { max_leaves: 4, mode: HarnessMode::PanicOnFirstError }
+        FuzzConfig { max_leaves: 4, min_ops: 0, mode: HarnessMode::PanicOnFirstError }
     }
 }
 
@@ -33,6 +35,11 @@ impl FuzzConfig {
             .unwrap_or(4)
             .clamp(1, 8);
 
+        let min_ops = std::env::var("MIN_OPS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+
         let mode = match std::env::var("MODE")
             .unwrap_or_default()
             .to_lowercase()
@@ -41,9 +48,8 @@ impl FuzzConfig {
             "continuous" => HarnessMode::Continuous,
             _ => HarnessMode::PanicOnFirstError,
         };
-        println!("FuzzConfig: max_leaves={}, mode={:?}", max_leaves, mode);
 
-        FuzzConfig { max_leaves, mode }
+        FuzzConfig { max_leaves, min_ops, mode }
     }
 }
 

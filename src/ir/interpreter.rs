@@ -20,6 +20,146 @@ use super::program::{AutogradProgram, FuzzConfig, SingleOpCase, TensorProgram};
 type PlainB = NdArray;
 type DiffB = Autodiff<NdArray>;
 
+// ─── shape tracking ──────────────────────────────────────────────────────────
+
+/// Lightweight 2-D shape tracked alongside every register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shape2(usize, usize);
+
+impl Shape2 {
+    /// Can two 2-D shapes be element-wise combined under NumPy broadcasting?
+    /// Each dimension must either be equal or one of them must be 1.
+    #[inline]
+    fn broadcast_compatible(self, other: Shape2) -> bool {
+        (self.0 == other.0 || self.0 == 1 || other.0 == 1)
+            && (self.1 == other.1 || self.1 == 1 || other.1 == 1)
+    }
+
+    /// Result shape after broadcasting two compatible shapes.
+    #[inline]
+    fn broadcast_result(self, other: Shape2) -> Shape2 {
+        Shape2(self.0.max(other.0), self.1.max(other.1))
+    }
+
+    /// Can `self` be left-multiplied by `other`?  i.e. `self @ other`
+    /// requires self.cols == other.rows.
+    #[inline]
+    fn matmul_compatible(self, other: Shape2) -> bool {
+        self.1 == other.0
+    }
+
+    /// Given a unary/binary TensorInstr, compute the output shape.
+    fn after_tensor_instr(shapes: &[Shape2], instr: &TensorInstr) -> Shape2 {
+        let n = shapes.len();
+        match instr {
+            TensorInstr::Add(a, b)
+            | TensorInstr::Sub(a, b)
+            | TensorInstr::Mul(a, b) => {
+                let sa = shapes[a.resolve(n)];
+                let sb = shapes[resolve_broadcast_compatible(shapes, a.resolve(n), b)];
+                sa.broadcast_result(sb)
+            }
+            TensorInstr::Matmul(a, b) => {
+                let sa = shapes[a.resolve(n)];
+                match resolve_matmul_compatible(shapes, a.resolve(n), b) {
+                    Some(bi) => Shape2(sa.0, shapes[bi].1),
+                    None => sa, // demoted to passthrough
+                }
+            }
+            TensorInstr::Neg(r)
+            | TensorInstr::Abs(r)
+            | TensorInstr::Exp(r)
+            | TensorInstr::Log(r)
+            | TensorInstr::Sqrt(r)
+            | TensorInstr::Relu(r)
+            | TensorInstr::Sigmoid(r)
+            | TensorInstr::Tanh(r)
+            | TensorInstr::Clamp(r) => shapes[r.resolve(n)],
+            TensorInstr::SumAll(_) | TensorInstr::MeanAll(_) => Shape2(1, 1),
+            TensorInstr::Transpose(r) => {
+                let Shape2(r_, c_) = shapes[r.resolve(n)];
+                Shape2(c_, r_)
+            }
+        }
+    }
+
+    /// Given a DiffOp, compute the output shape.  Returns `None` for `Leaf`
+    /// (handled by the main loop).
+    fn after_diff_op(shapes: &[Shape2], op: &DiffOp) -> Option<Shape2> {
+        let n = shapes.len();
+        Some(match op {
+            DiffOp::Leaf(_) => return None,
+            DiffOp::Add(a, b)
+            | DiffOp::Sub(a, b)
+            | DiffOp::Mul(a, b) => {
+                let sa = shapes[a.resolve(n)];
+                let sb = shapes[resolve_broadcast_compatible(shapes, a.resolve(n), b)];
+                sa.broadcast_result(sb)
+            }
+            DiffOp::Matmul(a, b) => {
+                let sa = shapes[a.resolve(n)];
+                match resolve_matmul_compatible(shapes, a.resolve(n), b) {
+                    Some(bi) => Shape2(sa.0, shapes[bi].1),
+                    None => sa, // demoted to passthrough
+                }
+            }
+            DiffOp::Neg(r)
+            | DiffOp::Abs(r)
+            | DiffOp::Exp(r)
+            | DiffOp::Log(r)
+            | DiffOp::Sqrt(r)
+            | DiffOp::Relu(r)
+            | DiffOp::Sigmoid(r)
+            | DiffOp::Tanh(r)
+            | DiffOp::Clamp(r) => shapes[r.resolve(n)],
+            DiffOp::SumAll(_) | DiffOp::MeanAll(_) => Shape2(1, 1),
+            DiffOp::Transpose(r) => {
+                let Shape2(r_, c_) = shapes[r.resolve(n)];
+                Shape2(c_, r_)
+            }
+        })
+    }
+}
+
+/// For element-wise binary operations (Add/Sub/Mul), resolve operand `b` to a
+/// register whose shape is **broadcast-compatible** with operand `a`.
+/// Falls back to `a` itself when nothing compatible exists.
+fn resolve_broadcast_compatible(shapes: &[Shape2], a_idx: usize, b_raw: &super::ops::Reg) -> usize {
+    let n = shapes.len();
+    let b_idx = b_raw.resolve(n);
+    let sa = shapes[a_idx];
+    if sa.broadcast_compatible(shapes[b_idx]) {
+        return b_idx;
+    }
+    // scan backward for any compatible register
+    for i in (0..n).rev() {
+        if sa.broadcast_compatible(shapes[i]) {
+            return i;
+        }
+    }
+    a_idx // ultimate fallback: a ⊕ a
+}
+
+/// For matmul, resolve operand `b` to a register where
+/// `shapes[a_idx].cols == shapes[b_idx].rows`.
+/// Returns `None` when no register in the file has compatible inner
+/// dimensions — callers should demote the matmul to a passthrough.
+fn resolve_matmul_compatible(shapes: &[Shape2], a_idx: usize, b_raw: &super::ops::Reg) -> Option<usize> {
+    let n = shapes.len();
+    let b_idx = b_raw.resolve(n);
+    let sa = shapes[a_idx];
+    if sa.matmul_compatible(shapes[b_idx]) {
+        return Some(b_idx);
+    }
+    // scan backward for any register whose rows == a.cols
+    for i in (0..n).rev() {
+        if sa.matmul_compatible(shapes[i]) {
+            return Some(i);
+        }
+    }
+    None // no valid matmul partner exists
+}
+
 /// Cycle raw bytes and map to f32 values in [-1, 1]
 fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
     if raw.is_empty() {
@@ -76,6 +216,7 @@ fn apply_tensor_op<B: Backend>(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>, op: &Tensor
         TensorOp::SumAll    => lhs.sum().unsqueeze::<2>(),
         TensorOp::MeanAll   => lhs.mean().unsqueeze::<2>(),
         TensorOp::Transpose => lhs.transpose(),
+        TensorOp::Matmul    => lhs.matmul(rhs),
         TensorOp::Clamp     => lhs.clamp(-1e6_f32, 1e6_f32),
     }
 }
@@ -155,13 +296,37 @@ fn run_single_op_oracle(case: &SingleOpCase) {
 // PLAIN TENSOR PROGRAM  (SSA register-file interpreter)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Evaluate one [`TensorInstr`] against the register file.
-fn eval_tensor_instr<B: Backend>(regs: &[Tensor<B, 2>], instr: &TensorInstr) -> Tensor<B, 2> {
+/// Evaluate one [`TensorInstr`] against the register file, using `shapes`
+/// to ensure binary operands are shape-compatible.
+fn eval_tensor_instr<B: Backend>(
+    regs: &[Tensor<B, 2>],
+    shapes: &[Shape2],
+    instr: &TensorInstr,
+) -> Tensor<B, 2> {
     let n = regs.len();
     match instr {
-        TensorInstr::Add(a, b)    => regs[a.resolve(n)].clone() + regs[b.resolve(n)].clone(),
-        TensorInstr::Sub(a, b)    => regs[a.resolve(n)].clone() - regs[b.resolve(n)].clone(),
-        TensorInstr::Mul(a, b)    => regs[a.resolve(n)].clone() * regs[b.resolve(n)].clone(),
+        TensorInstr::Add(a, b) => {
+            let ai = a.resolve(n);
+            let bi = resolve_broadcast_compatible(shapes, ai, b);
+            regs[ai].clone() + regs[bi].clone()
+        }
+        TensorInstr::Sub(a, b) => {
+            let ai = a.resolve(n);
+            let bi = resolve_broadcast_compatible(shapes, ai, b);
+            regs[ai].clone() - regs[bi].clone()
+        }
+        TensorInstr::Mul(a, b) => {
+            let ai = a.resolve(n);
+            let bi = resolve_broadcast_compatible(shapes, ai, b);
+            regs[ai].clone() * regs[bi].clone()
+        }
+        TensorInstr::Matmul(a, b) => {
+            let ai = a.resolve(n);
+            match resolve_matmul_compatible(shapes, ai, b) {
+                Some(bi) => regs[ai].clone().matmul(regs[bi].clone()),
+                None => regs[ai].clone(), // no valid partner → passthrough
+            }
+        }
         TensorInstr::Neg(r)       => regs[r.resolve(n)].clone().neg(),
         TensorInstr::Abs(r)       => regs[r.resolve(n)].clone().abs(),
         TensorInstr::Exp(r)       => regs[r.resolve(n)].clone().exp(),
@@ -198,10 +363,13 @@ fn run_tensor_program_inner(prog: &TensorProgram) {
         .reshape([rows, cols]);
 
     let mut regs: Vec<Tensor<PlainB, 2>> = vec![r0];
+    let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
 
     for instr in &prog.ops {
-        let val = eval_tensor_instr(&regs, instr);
+        let out_shape = Shape2::after_tensor_instr(&shapes, instr);
+        let val = eval_tensor_instr(&regs, &shapes, instr);
         regs.push(val);
+        shapes.push(out_shape);
     }
 
     // force evaluation of the last register
@@ -223,18 +391,39 @@ fn make_leaf<AB: AutodiffBackend>(raw: &[u8], rows: usize, cols: usize, device: 
     .require_grad()
 }
 
-/// Evaluate one non-Leaf [`DiffOp`] against the register file.
+/// Evaluate one non-Leaf [`DiffOp`] against the register file, using `shapes`
+/// to ensure binary operands are shape-compatible.
 /// Returns `None` for `Leaf` (handled by the main loop).
 fn eval_diff_op<AB: AutodiffBackend>(
     regs: &[Tensor<AB, 2>],
+    shapes: &[Shape2],
     op: &DiffOp,
 ) -> Option<Tensor<AB, 2>> {
     let n = regs.len();
     Some(match op {
-        DiffOp::Leaf(_)       => return None,
-        DiffOp::Add(a, b)     => regs[a.resolve(n)].clone() + regs[b.resolve(n)].clone(),
-        DiffOp::Sub(a, b)     => regs[a.resolve(n)].clone() - regs[b.resolve(n)].clone(),
-        DiffOp::Mul(a, b)     => regs[a.resolve(n)].clone() * regs[b.resolve(n)].clone(),
+        DiffOp::Leaf(_) => return None,
+        DiffOp::Add(a, b) => {
+            let ai = a.resolve(n);
+            let bi = resolve_broadcast_compatible(shapes, ai, b);
+            regs[ai].clone() + regs[bi].clone()
+        }
+        DiffOp::Sub(a, b) => {
+            let ai = a.resolve(n);
+            let bi = resolve_broadcast_compatible(shapes, ai, b);
+            regs[ai].clone() - regs[bi].clone()
+        }
+        DiffOp::Mul(a, b) => {
+            let ai = a.resolve(n);
+            let bi = resolve_broadcast_compatible(shapes, ai, b);
+            regs[ai].clone() * regs[bi].clone()
+        }
+        DiffOp::Matmul(a, b) => {
+            let ai = a.resolve(n);
+            match resolve_matmul_compatible(shapes, ai, b) {
+                Some(bi) => regs[ai].clone().matmul(regs[bi].clone()),
+                None => regs[ai].clone(), // no valid partner → passthrough
+            }
+        }
         DiffOp::Neg(r)        => regs[r.resolve(n)].clone().neg(),
         DiffOp::Abs(r)        => regs[r.resolve(n)].clone().abs(),
         DiffOp::Exp(r)        => regs[r.resolve(n)].clone().exp(),
@@ -245,6 +434,7 @@ fn eval_diff_op<AB: AutodiffBackend>(
         DiffOp::Tanh(r)       => activation::tanh(regs[r.resolve(n)].clone()),
         DiffOp::SumAll(r)     => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
         DiffOp::MeanAll(r)    => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
+        DiffOp::Transpose(r)  => regs[r.resolve(n)].clone().transpose(),
         DiffOp::Clamp(r)      => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
     })
 }
@@ -267,11 +457,12 @@ fn collect_grads<AB: AutodiffBackend>(
         device,
     );
     let mut regs: Vec<Tensor<AB, 2>> = vec![leaf_0];
+    let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
     let mut leaf_indices: Vec<usize> = vec![0]; // register indices that are leaves
     let mut leaf_count: usize = 1;
 
     for op in &prog.ops {
-        let val = match op {
+        let (val, out_shape) = match op {
             DiffOp::Leaf(seed_idx) => {
                 if leaf_count < config.max_leaves {
                     let pool_idx = if prog.leaf_seeds.is_empty() {
@@ -287,15 +478,23 @@ fn collect_grads<AB: AutodiffBackend>(
                     let leaf = make_leaf::<AB>(raw, rows, cols, device);
                     leaf_indices.push(regs.len()); // index of the *next* push
                     leaf_count += 1;
-                    leaf
+                    (leaf, Shape2(rows, cols))
                 } else {
                     // Cap reached: alias an existing register
-                    regs[(*seed_idx as usize) % regs.len()].clone()
+                    let alias_idx = (*seed_idx as usize) % regs.len();
+                    (regs[alias_idx].clone(), shapes[alias_idx])
                 }
             }
-            _ => eval_diff_op(&regs, op).expect("non-Leaf op returned None"),
+            _ => {
+                let out_shape = Shape2::after_diff_op(&shapes, op)
+                    .expect("non-Leaf op returned None shape");
+                let val = eval_diff_op(&regs, &shapes, op)
+                    .expect("non-Leaf op returned None");
+                (val, out_shape)
+            }
         };
         regs.push(val);
+        shapes.push(out_shape);
     }
 
     // backward from the last register

@@ -58,6 +58,8 @@ pub enum TensorOp {
     MeanAll,
     // --- layout ---
     Transpose,
+    // --- matmul ---
+    Matmul,
     // --- guard ---
     Clamp,
 }
@@ -79,6 +81,7 @@ impl TensorOp {
             TensorOp::SumAll   => format!("{out} = sum({inp})  # → [1,1]"),
             TensorOp::MeanAll  => format!("{out} = mean({inp})  # → [1,1]"),
             TensorOp::Transpose => format!("{out} = {inp}.T"),
+            TensorOp::Matmul   => format!("{out} = {inp} @ {inp}"),
             TensorOp::Clamp    => format!("{out} = clamp({inp}, -1e6, 1e6)"),
         }
     }
@@ -109,6 +112,8 @@ pub enum TensorInstr {
     MeanAll(Reg),
     // --- layout ---
     Transpose(Reg),
+    // --- matmul ---
+    Matmul(Reg, Reg),
     // --- guard ---
     Clamp(Reg),
 }
@@ -132,6 +137,7 @@ impl TensorInstr {
             TensorInstr::SumAll(r)    => format!("{out} = sum({})  # → [1,1]", r.name(num_regs)),
             TensorInstr::MeanAll(r)   => format!("{out} = mean({})  # → [1,1]", r.name(num_regs)),
             TensorInstr::Transpose(r) => format!("{out} = {}.T", r.name(num_regs)),
+            TensorInstr::Matmul(a, b) => format!("{out} = {} @ {}", a.name(num_regs), b.name(num_regs)),
             TensorInstr::Clamp(r)     => format!("{out} = clamp({}, -1e6, 1e6)", r.name(num_regs)),
         }
     }
@@ -166,6 +172,10 @@ pub enum DiffOp {
     // --- reductions ---
     SumAll(Reg),
     MeanAll(Reg),
+    // --- layout ---
+    Transpose(Reg),
+    // --- matmul ---
+    Matmul(Reg, Reg),
     // --- guard ---
     Clamp(Reg),
 }
@@ -190,6 +200,8 @@ impl DiffOp {
             DiffOp::Tanh(r)       => format!("{out} = tanh({})", r.name(num_regs)),
             DiffOp::SumAll(r)     => format!("{out} = sum({})  # → [1,1]", r.name(num_regs)),
             DiffOp::MeanAll(r)    => format!("{out} = mean({})  # → [1,1]", r.name(num_regs)),
+            DiffOp::Transpose(r)  => format!("{out} = {}.T", r.name(num_regs)),
+            DiffOp::Matmul(a, b)  => format!("{out} = {} @ {}", a.name(num_regs), b.name(num_regs)),
             DiffOp::Clamp(r)      => format!("{out} = clamp({}, -1e6, 1e6)", r.name(num_regs)),
         }
     }

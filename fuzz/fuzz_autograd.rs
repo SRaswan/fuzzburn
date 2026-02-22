@@ -22,6 +22,7 @@ fuzz_target!(|prog: AutogradProgram| {
             HarnessMode::PanicOnFirstError => {
                 panic!("fuzz_autograd CRASH:\n{display}\nerror: {msg}");
             }
+            // TODO: maybe somehow log the terminal output to a file?
             HarnessMode::Continuous => {
                 eprintln!("\n=== CRASH (fuzz_autograd, continuing) ===\n{display}\nerror: {msg}\n");
             }

@@ -14,20 +14,13 @@ oracle-tch = ["fuzzburn/oracle-tch"]
 libfuzzer-sys = "0.4"
 fuzzburn = { path = ".." }
 
-# Three fuzz targets:
+# Two fuzz targets:
 #   cargo fuzz run fuzz_tensor_ops  – multi-op TensorProgram, NdArray backend
-#   cargo fuzz run fuzz_single_op   – one op, two tensors; oracle-tch for diff-testing
 #   cargo fuzz run fuzz_autograd    – autograd / backward-pass fuzzing
 
 [[bin]]
 name = "fuzz_tensor_ops"
 path = "fuzz_tensor_ops.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "fuzz_single_op"
-path = "fuzz_single_op.rs"
 test = false
 doc = false
 

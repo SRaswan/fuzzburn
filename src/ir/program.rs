@@ -2,7 +2,7 @@
 
 use std::fmt;
 use arbitrary::Arbitrary;
-use super::ops::{DiffOp, TensorOp, TensorInstr};
+use super::ops::{DiffOp, TensorInstr};
 
 // ─── harness mode ─────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,28 +50,6 @@ impl FuzzConfig {
         };
 
         FuzzConfig { max_leaves, min_ops, mode }
-    }
-}
-
-// ─── single-op test case ──────────────────────────────────────────────────────
-
-#[derive(Arbitrary, Debug)]
-pub struct SingleOpCase {
-    pub rows: u8,
-    pub cols: u8,
-    pub lhs: Vec<u8>,
-    pub rhs: Vec<u8>,
-    pub op: TensorOp,
-}
-
-impl fmt::Display for SingleOpCase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rows = (self.rows as usize).clamp(1, 16);
-        let cols = (self.cols as usize).clamp(1, 16);
-        writeln!(f, "=== SingleOpCase [{}×{}] ===", rows, cols)?;
-        writeln!(f, "a = input({}×{}, {} seed bytes)", rows, cols, self.lhs.len())?;
-        writeln!(f, "b = input({}×{}, {} seed bytes)", rows, cols, self.rhs.len())?;
-        write!(f, "{}", self.op.ssa_line("result", "a"))
     }
 }
 

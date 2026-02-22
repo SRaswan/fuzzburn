@@ -1,5 +1,5 @@
 /// Burn autograd example
-/// cargo run --example simple_autograd
+/// cargo run --example transpose_bug
 
 use burn::backend::{Autodiff, LibTorch, NdArray};
 use burn::backend::libtorch::LibTorchDevice;
@@ -9,8 +9,8 @@ fn run<B: AutodiffBackend<FloatElem = f32>>(device: &B::Device, label: &str) {
     let x_0: Tensor<B, 2> = Tensor::full([3, 3], 0.5_f32, device).require_grad();
 
     let t0 = x_0.clone();
-    let t1 = t0.clone() + t0.transpose();
-    let t2 = t1.log();
+    let t1 = t0.clone().transpose();
+    let t2 = t1 + t0.clone();
     let grads = t2.backward();
 
     let x_grad = x_0.grad(&grads).unwrap();

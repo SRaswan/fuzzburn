@@ -4,4 +4,4 @@ pub mod interpreter;
 pub mod ops;
 pub mod program;
 
-pub use program::{FuzzConfig, HarnessMode, SingleOpCase};
+pub use program::{FuzzConfig, HarnessMode};

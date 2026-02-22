@@ -33,60 +33,6 @@ impl fmt::Display for Reg {
     }
 }
 
-// ─── plain tensor op (SingleOpCase opcode) ───────────────────────────────────
-
-/// Operation enum for isolated single-op testing (`SingleOpCase`).
-/// NOT used in SSA programs directly.
-#[derive(Arbitrary, Debug, Clone)]
-pub enum TensorOp {
-    // --- binary ---
-    Add,
-    Sub,
-    Mul,
-    // --- unary elementwise ---
-    Neg,
-    Abs,
-    Exp,
-    Log,
-    Sqrt,
-    // --- activations ---
-    Relu,
-    Sigmoid,
-    Tanh,
-    // --- reductions ---
-    SumAll,
-    MeanAll,
-    // --- layout ---
-    Transpose,
-    // --- matmul ---
-    Matmul,
-    // --- guard ---
-    Clamp,
-}
-
-impl TensorOp {
-    pub fn ssa_line(&self, out: &str, inp: &str) -> String {
-        match self {
-            TensorOp::Add      => format!("{out} = {inp} + {inp}"),
-            TensorOp::Sub      => format!("{out} = {inp} - {inp}"),
-            TensorOp::Mul      => format!("{out} = {inp} * {inp}"),
-            TensorOp::Neg      => format!("{out} = -{inp}"),
-            TensorOp::Abs      => format!("{out} = abs({inp})"),
-            TensorOp::Exp      => format!("{out} = exp({inp})"),
-            TensorOp::Log      => format!("{out} = log({inp})"),
-            TensorOp::Sqrt     => format!("{out} = sqrt({inp})"),
-            TensorOp::Relu     => format!("{out} = relu({inp})"),
-            TensorOp::Sigmoid  => format!("{out} = sigmoid({inp})"),
-            TensorOp::Tanh     => format!("{out} = tanh({inp})"),
-            TensorOp::SumAll   => format!("{out} = sum({inp})  # → [1,1]"),
-            TensorOp::MeanAll  => format!("{out} = mean({inp})  # → [1,1]"),
-            TensorOp::Transpose => format!("{out} = {inp}.T"),
-            TensorOp::Matmul   => format!("{out} = {inp} @ {inp}"),
-            TensorOp::Clamp    => format!("{out} = clamp({inp}, -1e6, 1e6)"),
-        }
-    }
-}
-
 // ─── SSA tensor instruction ──────────────────────────────────────────────────
 
 /// SSA instruction for plain tensor programs.

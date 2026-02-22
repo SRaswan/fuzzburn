@@ -2,7 +2,7 @@
 
 use std::fmt;
 use arbitrary::Arbitrary;
-use super::ops::{DiffOp, TensorOp, TensorRef};
+use super::ops::{DiffOp, TensorOp, TensorInstr};
 
 // ─── harness mode ─────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,7 +14,7 @@ pub enum HarnessMode {
 // ─── fuzz config ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct FuzzConfig {
-    /// Upper bound on the number of distinct leaf tensors that may be used
+    /// Upper bound on the number of distinct leaf tensors that may be introduced
     pub max_leaves: usize,
     pub mode: HarnessMode,
 }
@@ -27,13 +27,13 @@ impl Default for FuzzConfig {
 
 impl FuzzConfig {
     pub fn from_env() -> Self {
-        let max_leaves = std::env::var("FUZZ_MAX_LEAVES")
+        let max_leaves = std::env::var("MAX_LEAVES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(4)
             .clamp(1, 8);
 
-        let mode = match std::env::var("FUZZ_MODE")
+        let mode = match std::env::var("MODE")
             .unwrap_or_default()
             .to_lowercase()
             .as_str()
@@ -41,6 +41,7 @@ impl FuzzConfig {
             "continuous" => HarnessMode::Continuous,
             _ => HarnessMode::PanicOnFirstError,
         };
+        println!("FuzzConfig: max_leaves={}, mode={:?}", max_leaves, mode);
 
         FuzzConfig { max_leaves, mode }
     }
@@ -68,14 +69,16 @@ impl fmt::Display for SingleOpCase {
     }
 }
 
-// ─── plain tensor program ─────────────────────────────────────────────────────
+// ─── plain tensor program (SSA) ──────────────────────────────────────────────
 
+/// SSA tensor program.  `r0` is seeded from `values`; every [`TensorInstr`]
+/// appends a new register to the file.
 #[derive(Arbitrary, Debug)]
 pub struct TensorProgram {
     pub rows: u8,
     pub cols: u8,
     pub values: Vec<u8>,
-    pub ops: Vec<TensorOp>,
+    pub ops: Vec<TensorInstr>,
 }
 
 impl fmt::Display for TensorProgram {
@@ -83,88 +86,101 @@ impl fmt::Display for TensorProgram {
         let rows = (self.rows as usize).clamp(1, 16);
         let cols = (self.cols as usize).clamp(1, 16);
         writeln!(f, "=== TensorProgram [{}×{}] ===", rows, cols)?;
-        writeln!(f, "t0 = input({}×{}, {} seed bytes)", rows, cols, self.values.len())?;
-        let mut cur = "t0".to_string();
-        for (i, op) in self.ops.iter().enumerate() {
-            let next = format!("t{}", i + 1);
-            writeln!(f, "{}", op.ssa_line(&next, &cur))?;
-            cur = next;
+        writeln!(f, "r0 = input({}×{}, {} seed bytes)", rows, cols, self.values.len())?;
+        let mut num_regs: usize = 1;
+        for instr in &self.ops {
+            let out = format!("r{}", num_regs);
+            writeln!(f, "{}", instr.ssa_line(&out, num_regs))?;
+            num_regs += 1;
         }
-        write!(f, "result = {cur}.into_data()")
+        write!(f, "result = r{}.into_data()", num_regs - 1)
     }
 }
 
-// ─── autograd program ─────────────────────────────────────────────────────────
+// ─── autograd program (SSA) ──────────────────────────────────────────────────
 
-/// Fuzzable program targeting the autodiff backend.
-/// `leaves` is generated freely by `arbitrary`
-/// `TensorRef::Leaf(i)` in `ops` is resolved to `leaves[i % num_inputs]`.
+/// SSA autograd program.
+///
+/// `r0` is always the seed leaf (`requires_grad`).  [`DiffOp::Leaf`]
+/// instructions introduce additional leaves (up to `max_leaves`).  All other
+/// [`DiffOp`] variants reference registers by [`Reg`] and push new values.
+///
+/// The register file is a flat `Vec<Tensor>` — leaves and intermediates share
+/// the same index space, so the fuzzer can freely compose any DAG.
 #[derive(Arbitrary, Debug)]
 pub struct AutogradProgram {
     pub rows: u8,
     pub cols: u8,
-    pub leaves: Vec<Vec<u8>>,
+    /// Pool of seed byte-vectors for leaf tensors.
+    pub leaf_seeds: Vec<Vec<u8>>,
     pub ops: Vec<DiffOp>,
 }
 
 impl AutogradProgram {
-    // print that "simulates" dispatch leaf logic
+    /// Pretty-print the program in SSA form, simulating register resolution.
     pub fn ssa(&self, max_leaves: usize) -> String {
         use std::fmt::Write;
         let rows = (self.rows as usize).clamp(1, 16);
         let cols = (self.cols as usize).clamp(1, 16);
         let mut s = String::new();
 
-        let mut num_introduced: usize = 1; // x_0 is always the seed
+        let _ = writeln!(
+            s,
+            "=== AutogradProgram [{}×{}] (max_leaves={}) ===",
+            rows, cols, max_leaves
+        );
 
-        let _ = writeln!(s, "=== AutogradProgram [{}×{}] (max_leaves={}) ===", rows, cols, max_leaves);
-        let seed0 = self.leaves.get(0).map(|v| v.len()).unwrap_or(0);
-        let _ = writeln!(s, "x_0 = input({}×{}, {seed0} seed bytes)  [requires_grad, seed]", rows, cols);
-        let _ = writeln!(s, "t0 = x_0  # accumulator seed");
+        // r0 = seed leaf (always present)
+        let seed0_len = self.leaf_seeds.first().map(|v| v.len()).unwrap_or(0);
+        let _ = writeln!(
+            s,
+            "r0 = leaf({}×{}, {} seed bytes)  [requires_grad, seed]",
+            rows, cols, seed0_len
+        );
 
-        let mut cur = "t0".to_string();
-        for (i, op) in self.ops.iter().enumerate() {
-            let next = format!("t{}", i + 1);
-            let line = match op {
-                DiffOp::Add(r) | DiffOp::Sub(r) | DiffOp::Mul(r) => {
-                    let op_sym = match op {
-                        DiffOp::Add(_) => "+",
-                        DiffOp::Sub(_) => "-",
-                        DiffOp::Mul(_) => "*",
-                        _ => unreachable!(),
-                    };
-                    match r {
-                        TensorRef::Current => format!("{next} = {cur} {op_sym} {cur}"),
-                        TensorRef::Leaf(_) => {
-                            if let Some((idx, new_count)) =
-                                r.dispatch_leaf_idx(num_introduced, max_leaves)
-                            {
-                                if new_count > num_introduced {
-                                    let seed_len =
-                                        self.leaves.get(idx).map(|v| v.len()).unwrap_or(0);
-                                    let _ = writeln!(
-                                        s,
-                                        "x_{idx} = input({}×{}, {seed_len} seed bytes)  \
-                                         [requires_grad, introduced here]",
-                                        rows, cols
-                                    );
-                                    num_introduced = new_count;
-                                }
-                                format!("{next} = {cur} {op_sym} x_{idx}")
-                            } else {
-                                format!("{next} = {cur} {op_sym} {cur}")
-                            }
-                        }
+        let mut num_regs: usize = 1;
+        let mut leaf_count: usize = 1;
+        let mut leaf_reg_indices: Vec<usize> = vec![0];
+
+        for op in &self.ops {
+            let out = format!("r{}", num_regs);
+            match op {
+                DiffOp::Leaf(seed_idx) => {
+                    if leaf_count < max_leaves {
+                        let pool_idx = if self.leaf_seeds.is_empty() {
+                            0
+                        } else {
+                            *seed_idx as usize % self.leaf_seeds.len()
+                        };
+                        let seed_len =
+                            self.leaf_seeds.get(pool_idx).map(|v| v.len()).unwrap_or(0);
+                        let _ = writeln!(
+                            s,
+                            "{out} = leaf({}×{}, {seed_len} seed bytes)  \
+                             [requires_grad, leaf #{leaf_count}]",
+                            rows, cols
+                        );
+                        leaf_reg_indices.push(num_regs);
+                        leaf_count += 1;
+                    } else {
+                        let src = (*seed_idx as usize) % num_regs;
+                        let _ = writeln!(
+                            s,
+                            "{out} = r{src}  # leaf cap reached, alias"
+                        );
                     }
                 }
-                _ => op.ssa_line(&next, &cur),
-            };
-            let _ = writeln!(s, "{line}");
-            cur = next;
+                _ => {
+                    let _ = writeln!(s, "{}", op.ssa_line(&out, num_regs));
+                }
+            }
+            num_regs += 1;
         }
-        let _ = writeln!(s, "grads = backward({cur})");
-        for i in 0..num_introduced {
-            let _ = writeln!(s, "assert x_{i}.grad(grads).is_some()");
+
+        let last = num_regs - 1;
+        let _ = writeln!(s, "grads = backward(r{last})");
+        for &ri in &leaf_reg_indices {
+            let _ = writeln!(s, "grad r{ri} = r{ri}.grad(grads)  # None → zeros if unreachable");
         }
         s
     }

@@ -1,4 +1,4 @@
-// IR interpreter – walks the AST and runs the Burn tensor API.
+// IR interpreter – walks SSA programs using a register-file architecture.
 
 use std::panic;
 use burn::backend::ndarray::NdArrayDevice;
@@ -11,7 +11,7 @@ use burn::backend::LibTorch;
 #[cfg(feature = "oracle-tch")]
 use burn::backend::libtorch::LibTorchDevice;
 
-use super::ops::{DiffOp, TensorOp, TensorRef};
+use super::ops::{DiffOp, TensorOp, TensorInstr};
 use super::program::{AutogradProgram, FuzzConfig, HarnessMode, SingleOpCase, TensorProgram};
 
 type PlainB = NdArray;
@@ -29,18 +29,20 @@ fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
 
 /// - `PanicOnFirstError` -> resume unwind and libFuzzer records crash
 /// - `Continuous`        -> log to stderr and return (fuzzer keeps running)
-fn handle_crash(e: Box<dyn std::any::Any + Send>, display: &str, target: &str, mode: HarnessMode) {
+pub fn handle_crash(e: Box<dyn std::any::Any + Send>, display: &str, target: &str, mode: HarnessMode) {
     eprintln!("\n=== CRASH DETECTED ({target}) ===");
     eprintln!("{display}");
     eprintln!("========================================\n");
     match mode {
         HarnessMode::PanicOnFirstError => panic::resume_unwind(e),
-        HarnessMode::Continuous => {  }
+        HarnessMode::Continuous => { println!("Continuing fuzzing despite the crash..."); }
     }
 }
 
-// TENSOR OPS
-// ─────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// SINGLE-OP (unchanged – operates on two explicit tensors, not an SSA program)
+// ═══════════════════════════════════════════════════════════════════════════════
+
 /// Build a 2-D tensor from raw seed bytes for any backend.
 fn make_plain_tensor<B: Backend>(raw: &[u8], rows: usize, cols: usize, device: &B::Device) -> Tensor<B, 2> {
     Tensor::<B, 1>::from_floats(bytes_to_floats(raw, rows * cols).as_slice(), device)
@@ -108,7 +110,7 @@ fn run_single_op_on_libtorch(case: &SingleOpCase) -> Vec<f32> {
 
 /// TODO: make tolerance an environmental var
 #[cfg(feature = "oracle-tch")]
-fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
+fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str){
     assert_eq!(ndarray.len(), libtorch.len(), "oracle shape mismatch in {label}");
     let mut mismatches = 0_usize;
     for (i, (&a, &b)) in ndarray.iter().zip(libtorch).enumerate() {
@@ -122,8 +124,9 @@ fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
         }
     }
     if mismatches > 0 {
-        panic!("{mismatches} oracle mismatch(es) in op {label}");
+        panic!("oracle detected {} mismatches in {}", mismatches, label);
     }
+
 }
 
 /// compare with libtorch
@@ -142,11 +145,33 @@ fn run_single_op_oracle(case: &SingleOpCase) {
     compare_outputs(&ndarray_out, &libtorch_out, &format!("{:?}", case.op));
 }
 
-// plain tensor interpreter 
-// ─────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLAIN TENSOR PROGRAM  (SSA register-file interpreter)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/// run TensorProgram against plain NdArray backend
-/// TODO: compare with libtorch
+/// Evaluate one [`TensorInstr`] against the register file.
+fn eval_tensor_instr<B: Backend>(regs: &[Tensor<B, 2>], instr: &TensorInstr) -> Tensor<B, 2> {
+    let n = regs.len();
+    match instr {
+        TensorInstr::Add(a, b)    => regs[a.resolve(n)].clone() + regs[b.resolve(n)].clone(),
+        TensorInstr::Sub(a, b)    => regs[a.resolve(n)].clone() - regs[b.resolve(n)].clone(),
+        TensorInstr::Mul(a, b)    => regs[a.resolve(n)].clone() * regs[b.resolve(n)].clone(),
+        TensorInstr::Neg(r)       => regs[r.resolve(n)].clone().neg(),
+        TensorInstr::Abs(r)       => regs[r.resolve(n)].clone().abs(),
+        TensorInstr::Exp(r)       => regs[r.resolve(n)].clone().exp(),
+        TensorInstr::Log(r)       => regs[r.resolve(n)].clone().log(),
+        TensorInstr::Sqrt(r)      => regs[r.resolve(n)].clone().sqrt(),
+        TensorInstr::Relu(r)      => activation::relu(regs[r.resolve(n)].clone()),
+        TensorInstr::Sigmoid(r)   => activation::sigmoid(regs[r.resolve(n)].clone()),
+        TensorInstr::Tanh(r)      => activation::tanh(regs[r.resolve(n)].clone()),
+        TensorInstr::SumAll(r)    => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
+        TensorInstr::MeanAll(r)   => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
+        TensorInstr::Transpose(r) => regs[r.resolve(n)].clone().transpose(),
+        TensorInstr::Clamp(r)     => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
+    }
+}
+
+/// Run a plain SSA TensorProgram against NdArray.
 pub fn run_tensor_program(prog: &TensorProgram, mode: HarnessMode) {
     let display = prog.to_string();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -162,40 +187,30 @@ fn run_tensor_program_inner(prog: &TensorProgram) {
     let cols = (prog.cols as usize).clamp(1, 16);
     let device = NdArrayDevice::default();
 
-    let data = bytes_to_floats(&prog.values, rows * cols);
-    let mut t: Tensor<PlainB, 2> =
-        Tensor::<PlainB, 1>::from_floats(data.as_slice(), &device).reshape([rows, cols]);
+    // r0 = initial tensor
+    let r0: Tensor<PlainB, 2> =
+        Tensor::<PlainB, 1>::from_floats(
+            bytes_to_floats(&prog.values, rows * cols).as_slice(),
+            &device,
+        )
+        .reshape([rows, cols]);
 
-    for op in &prog.ops {
-        t = step_tensor(t, op);
+    let mut regs: Vec<Tensor<PlainB, 2>> = vec![r0];
+
+    for instr in &prog.ops {
+        let val = eval_tensor_instr(&regs, instr);
+        regs.push(val);
     }
 
-    let _ = t.into_data(); // force evaluation
-}
-
-/// Single-step evaluation for one TensorOp
-fn step_tensor(t: Tensor<PlainB, 2>, op: &TensorOp) -> Tensor<PlainB, 2> {
-    match op {
-        TensorOp::Add => t.clone() + t.clone(),
-        TensorOp::Sub => t.clone() - t.clone(),
-        TensorOp::Mul => t.clone() * t.clone(),
-        TensorOp::Neg => t.neg(),
-        TensorOp::Abs => t.abs(),
-        TensorOp::Exp => t.exp(),
-        TensorOp::Log => t.log(),
-        TensorOp::Sqrt => t.sqrt(),
-        TensorOp::Relu => activation::relu(t),
-        TensorOp::Sigmoid => activation::sigmoid(t),
-        TensorOp::Tanh => activation::tanh(t),
-        TensorOp::SumAll => t.sum().unsqueeze::<2>(),
-        TensorOp::MeanAll => t.mean().unsqueeze::<2>(),
-        TensorOp::Transpose => t.transpose(),
-        TensorOp::Clamp => t.clamp(-1e6_f32, 1e6_f32),
+    // force evaluation of the last register
+    if let Some(last) = regs.pop() {
+        let _ = last.into_data();
     }
 }
 
-// Autograd interpreter 
-// ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTOGRAD PROGRAM  (SSA register-file interpreter with gradient collection)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 fn make_leaf<AB: AutodiffBackend>(raw: &[u8], rows: usize, cols: usize, device: &AB::Device) -> Tensor<AB, 2> {
     Tensor::<AB, 1>::from_floats(
@@ -206,77 +221,34 @@ fn make_leaf<AB: AutodiffBackend>(raw: &[u8], rows: usize, cols: usize, device: 
     .require_grad()
 }
 
-/// Resolve a [`TensorRef`] using the leaf-stack dispatch algorithm.
-///
-/// - `TensorRef::Current` → clone the accumulator t
-/// - `TensorRef::Leaf(raw)` → reuse or introduce a leaf via
-///   [`TensorRef::dispatch_leaf_idx`], growing `leaf_stack` when a new leaf used
-///   is introduced.
-fn resolve_ref<AB: AutodiffBackend>(
-    r: &TensorRef,
-    t: &Tensor<AB, 2>,
-    leaf_stack: &mut Vec<Tensor<AB, 2>>,
-    leaf_data: &[Vec<u8>],
-    max_leaves: usize,
-    rows: usize,
-    cols: usize,
-    device: &AB::Device,
-) -> Tensor<AB, 2> {
-    match r.dispatch_leaf_idx(leaf_stack.len(), max_leaves) {
-        None => t.clone(), // TensorRef::Current
-        Some((idx, new_count)) => {
-            if new_count > leaf_stack.len() {
-                // Introduce a new leaf at position `idx` (= old stack length).
-                let raw = leaf_data.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                leaf_stack.push(make_leaf::<AB>(raw, rows, cols, device));
-            }
-            leaf_stack[idx].clone()
-        }
-    }
-}
-
-/// Single-step evaluation for one [`DiffOp`].
-///
-/// Binary ops call [`resolve_ref`], which may grow `leaf_stack`.
-fn step_diff<AB: AutodiffBackend>(
-    t: Tensor<AB, 2>,
+/// Evaluate one non-Leaf [`DiffOp`] against the register file.
+/// Returns `None` for `Leaf` (handled by the main loop).
+fn eval_diff_op<AB: AutodiffBackend>(
+    regs: &[Tensor<AB, 2>],
     op: &DiffOp,
-    leaf_stack: &mut Vec<Tensor<AB, 2>>,
-    leaf_data: &[Vec<u8>],
-    max_leaves: usize,
-    rows: usize,
-    cols: usize,
-    device: &AB::Device,
-) -> Tensor<AB, 2> {
-    match op {
-        DiffOp::Add(r) => {
-            let rhs = resolve_ref(r, &t, leaf_stack, leaf_data, max_leaves, rows, cols, device);
-            t.clone() + rhs
-        }
-        DiffOp::Sub(r) => {
-            let rhs = resolve_ref(r, &t, leaf_stack, leaf_data, max_leaves, rows, cols, device);
-            t.clone() - rhs
-        }
-        DiffOp::Mul(r) => {
-            let rhs = resolve_ref(r, &t, leaf_stack, leaf_data, max_leaves, rows, cols, device);
-            t.clone() * rhs
-        }
-        DiffOp::Neg     => t.neg(),
-        DiffOp::Abs     => t.abs(),
-        DiffOp::Exp     => t.exp(),
-        DiffOp::Log     => t.log(),
-        DiffOp::Sqrt    => t.sqrt(),
-        DiffOp::Relu    => activation::relu(t),
-        DiffOp::Sigmoid => activation::sigmoid(t),
-        DiffOp::Tanh    => activation::tanh(t),
-        DiffOp::MeanAll => t.mean().unsqueeze::<2>(),
-        DiffOp::SumAll  => t.sum().unsqueeze::<2>(),
-        DiffOp::Clamp   => t.clamp(-1e6_f32, 1e6_f32),
-    }
+) -> Option<Tensor<AB, 2>> {
+    let n = regs.len();
+    Some(match op {
+        DiffOp::Leaf(_)       => return None,
+        DiffOp::Add(a, b)     => regs[a.resolve(n)].clone() + regs[b.resolve(n)].clone(),
+        DiffOp::Sub(a, b)     => regs[a.resolve(n)].clone() - regs[b.resolve(n)].clone(),
+        DiffOp::Mul(a, b)     => regs[a.resolve(n)].clone() * regs[b.resolve(n)].clone(),
+        DiffOp::Neg(r)        => regs[r.resolve(n)].clone().neg(),
+        DiffOp::Abs(r)        => regs[r.resolve(n)].clone().abs(),
+        DiffOp::Exp(r)        => regs[r.resolve(n)].clone().exp(),
+        DiffOp::Log(r)        => regs[r.resolve(n)].clone().log(),
+        DiffOp::Sqrt(r)       => regs[r.resolve(n)].clone().sqrt(),
+        DiffOp::Relu(r)       => activation::relu(regs[r.resolve(n)].clone()),
+        DiffOp::Sigmoid(r)    => activation::sigmoid(regs[r.resolve(n)].clone()),
+        DiffOp::Tanh(r)       => activation::tanh(regs[r.resolve(n)].clone()),
+        DiffOp::SumAll(r)     => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
+        DiffOp::MeanAll(r)    => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
+        DiffOp::Clamp(r)      => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
+    })
 }
 
 /// Run `prog` on any autodiff backend, returning gradient data for every leaf
-/// in stack order.  Panics if any leaf is missing a gradient.
+/// in introduction order.  Panics if any leaf is missing a gradient.
 fn collect_grads<AB: AutodiffBackend>(
     prog: &AutogradProgram,
     config: &FuzzConfig,
@@ -285,36 +257,79 @@ fn collect_grads<AB: AutodiffBackend>(
     let rows = (prog.rows as usize).clamp(1, 16);
     let cols = (prog.cols as usize).clamp(1, 16);
 
-    let leaf_0 = make_leaf::<AB>(prog.leaves.get(0).map(Vec::as_slice).unwrap_or(&[]), rows, cols, device);
-    let mut leaf_stack: Vec<Tensor<AB, 2>> = vec![leaf_0.clone()];
-    let mut t = leaf_0;
+    // r0 = seed leaf (always present)
+    let leaf_0 = make_leaf::<AB>(
+        prog.leaf_seeds.first().map(Vec::as_slice).unwrap_or(&[]),
+        rows,
+        cols,
+        device,
+    );
+    let mut regs: Vec<Tensor<AB, 2>> = vec![leaf_0];
+    let mut leaf_indices: Vec<usize> = vec![0]; // register indices that are leaves
+    let mut leaf_count: usize = 1;
+
     for op in &prog.ops {
-        t = step_diff(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, device);
+        let val = match op {
+            DiffOp::Leaf(seed_idx) => {
+                if leaf_count < config.max_leaves {
+                    let pool_idx = if prog.leaf_seeds.is_empty() {
+                        0
+                    } else {
+                        *seed_idx as usize % prog.leaf_seeds.len()
+                    };
+                    let raw = prog
+                        .leaf_seeds
+                        .get(pool_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let leaf = make_leaf::<AB>(raw, rows, cols, device);
+                    leaf_indices.push(regs.len()); // index of the *next* push
+                    leaf_count += 1;
+                    leaf
+                } else {
+                    // Cap reached: alias an existing register
+                    regs[(*seed_idx as usize) % regs.len()].clone()
+                }
+            }
+            _ => eval_diff_op(&regs, op).expect("non-Leaf op returned None"),
+        };
+        regs.push(val);
     }
-    let grads = t.backward();
-    leaf_stack.iter().enumerate().map(|(i, leaf)| {
-        leaf.grad(&grads)
-            .unwrap_or_else(|| panic!("grad of leaf x_{i} missing after backward()"))
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap_or_else(|e| panic!("into_data for x_{i} grad failed: {e}"))
-    }).collect()
+
+    // backward from the last register
+    let last = regs.last().expect("register file is empty").clone();
+    let grads = last.backward();
+
+    leaf_indices
+        .iter()
+        .map(|&ri| {
+            match regs[ri].grad(&grads) {
+                Some(g) => g
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap_or_else(|e| panic!("into_data for r{ri} grad failed: {e}")),
+                // Leaf not reachable from the backward root → zero gradient
+                None => vec![0.0_f32; rows * cols],
+            }
+        })
+        .collect()
 }
 
-/// run AutogradProgram against Autodiff<NdArray> backend
+/// Run AutogradProgram against Autodiff<NdArray> backend.
 pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) {
-    let display = prog.ssa(config.max_leaves);
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let nd = collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
         #[cfg(feature = "oracle-tch")]
         run_autograd_oracle(prog, config, nd);
     }));
+            println!("Autograd program ran successfully withleaf(ves)");
+
     if let Err(e) = result {
-        handle_crash(e, &display, "fuzz_autograd", config.mode);
+        handle_crash(e, &prog.ssa(config.max_leaves), "fuzz_autograd", config.mode);
     }
 }
 
-// ─── autograd oracle (feature = "oracle-tch") ─────────────────────────────────────────────────
+// ─── autograd oracle (feature = "oracle-tch") ─────────────────────────────────
 
 /// The LibTorch autodiff backend type alias, mirroring `DiffB` for NdArray.
 #[cfg(feature = "oracle-tch")]
@@ -330,12 +345,9 @@ type DiffTch = Autodiff<LibTorch>;
 fn run_autograd_oracle(prog: &AutogradProgram, config: &FuzzConfig, nd: Vec<Vec<f32>>) {
     let lt = collect_grads::<DiffTch>(prog, config, &LibTorchDevice::Cpu);
     if nd.len() != lt.len() {
-        panic!(
-            "autograd oracle: NdArray produced {} leaf gradients, LibTorch produced {}",
-            nd.len(), lt.len()
-        );
+        panic!("oracle leaf count mismatch: NdArray={}, LibTorch={}", nd.len(), lt.len());
     }
     for (i, (nd_grad, lt_grad)) in nd.iter().zip(lt.iter()).enumerate() {
-        compare_outputs(nd_grad, lt_grad, &format!("grad x_{i}"));
+        compare_outputs(nd_grad, lt_grad, &format!("grad r{i}"));
     }
 }

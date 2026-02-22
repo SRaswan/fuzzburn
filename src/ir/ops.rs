@@ -1,72 +1,45 @@
-//! Instructions for fuzz IR.
-//! TensorRef is the "operand" type for binary ops
+//! SSA instructions for fuzz IR.
+//!
+//! The register file is a `Vec<Tensor>`.  Each instruction produces exactly one
+//! value and appends it.  Operands are [`Reg(u8)`] references resolved at
+//! interpretation time as `raw % num_defined_regs`.
 
 use std::fmt;
 use arbitrary::Arbitrary;
 
-#[derive(Arbitrary, Debug, Clone)]
-pub enum TensorRef {
-    /// Leaf tensor. byte drives TensorRef::dispatch_leaf_idx
-    Leaf(u8),
-    /// Current accumulated value (output of previous op)
-    Current,
-}
+// ─── register reference ──────────────────────────────────────────────────────
 
-impl TensorRef {
-    pub fn dispatch_leaf_idx(&self, num_used: usize, max_leaves: usize) -> Option<(usize, usize)> {
-        match self {
-            TensorRef::Current => None,
-            TensorRef::Leaf(raw) => {
-                let raw = *raw as usize;
-                let num_available = max_leaves.saturating_sub(num_used);
+/// A fuzzer-generated register reference.
+/// Resolved at interpretation time: `self.0 as usize % num_regs`.
+#[derive(Arbitrary, Debug, Clone, Copy)]
+pub struct Reg(pub u8);
 
-                Some(if num_used == 0 {
-                    // Stack is empty: always introduce x_0.
-                    (0, 1)
-                } else if num_available == 0 {
-                    // Stack full: must reuse
-                    // TODO: possibly bug for not resuing an input??
-                    (raw % num_used, num_used)
-                } else {
-                    // Reuse var probability = num_used / (num_used + num_avail)
-                    let threshold = (num_used * 256) / (num_used + num_available);
-                    if raw < threshold {
-                        (raw % num_used, num_used)
-                    } else {
-                        // Make new leaf
-                        (num_used, num_used + 1)
-                    }
-                })
-            }
-        }
+impl Reg {
+    /// Resolve to a valid register index.  `num_regs` must be > 0.
+    #[inline]
+    pub fn resolve(&self, num_regs: usize) -> usize {
+        (self.0 as usize) % num_regs
     }
 
-    pub fn name(&self, num_used: usize, max_leaves: usize) -> String {
-        match self.dispatch_leaf_idx(num_used, max_leaves) {
-            None => "t".to_string(),
-            Some((idx, _)) => format!("x_{idx}"),
-        }
+    /// Pretty-print using the resolved index.
+    pub fn name(&self, num_regs: usize) -> String {
+        format!("r{}", self.resolve(num_regs))
     }
 }
 
-impl fmt::Display for TensorRef {
+impl fmt::Display for Reg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TensorRef::Leaf(i) => write!(f, "x_{}", i),
-            TensorRef::Current => write!(f, "t"),
-        }
+        write!(f, "Reg({})", self.0)
     }
 }
 
-// plain tensor ops
-// ─────────────────────────────────────────────────────────
+// ─── plain tensor op (SingleOpCase opcode) ───────────────────────────────────
 
-/// TODO: more layout ops?  indexing/slicing ops?  (currently we just have Transpose)
-/// TODO: type/shape inference?
-/// TODO: differentiable backend ops should be compatible
+/// Operation enum for isolated single-op testing (`SingleOpCase`).
+/// NOT used in SSA programs directly.
 #[derive(Arbitrary, Debug, Clone)]
 pub enum TensorOp {
-    // --- binary (self ⊕ self) ---
+    // --- binary ---
     Add,
     Sub,
     Mul,
@@ -80,16 +53,15 @@ pub enum TensorOp {
     Relu,
     Sigmoid,
     Tanh,
-    // --- reductions (output becomes [1, 1] for all following ops) ---
+    // --- reductions ---
     SumAll,
     MeanAll,
     // --- layout ---
     Transpose,
-    // --- guard against runaway values ---
+    // --- guard ---
     Clamp,
 }
 
-// SSA print
 impl TensorOp {
     pub fn ssa_line(&self, out: &str, inp: &str) -> String {
         match self {
@@ -112,50 +84,113 @@ impl TensorOp {
     }
 }
 
-// differentiable ops 
-// ───────────────────────────────────────────────────────
+// ─── SSA tensor instruction ──────────────────────────────────────────────────
 
-/// differentiable subset of ops
+/// SSA instruction for plain tensor programs.
+/// Each instruction consumes register operand(s) and produces one new register.
+#[derive(Arbitrary, Debug, Clone)]
+pub enum TensorInstr {
+    // --- binary: result = reg ⊕ reg ---
+    Add(Reg, Reg),
+    Sub(Reg, Reg),
+    Mul(Reg, Reg),
+    // --- unary ---
+    Neg(Reg),
+    Abs(Reg),
+    Exp(Reg),
+    Log(Reg),
+    Sqrt(Reg),
+    // --- activations ---
+    Relu(Reg),
+    Sigmoid(Reg),
+    Tanh(Reg),
+    // --- reductions ---
+    SumAll(Reg),
+    MeanAll(Reg),
+    // --- layout ---
+    Transpose(Reg),
+    // --- guard ---
+    Clamp(Reg),
+}
+
+impl TensorInstr {
+    /// Pretty-print one SSA line.
+    /// `num_regs` = how many registers are defined *before* this instruction.
+    pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {
+        match self {
+            TensorInstr::Add(a, b)    => format!("{out} = {} + {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Sub(a, b)    => format!("{out} = {} - {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Mul(a, b)    => format!("{out} = {} * {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Neg(r)       => format!("{out} = -{}", r.name(num_regs)),
+            TensorInstr::Abs(r)       => format!("{out} = abs({})", r.name(num_regs)),
+            TensorInstr::Exp(r)       => format!("{out} = exp({})", r.name(num_regs)),
+            TensorInstr::Log(r)       => format!("{out} = log({})", r.name(num_regs)),
+            TensorInstr::Sqrt(r)      => format!("{out} = sqrt({})", r.name(num_regs)),
+            TensorInstr::Relu(r)      => format!("{out} = relu({})", r.name(num_regs)),
+            TensorInstr::Sigmoid(r)   => format!("{out} = sigmoid({})", r.name(num_regs)),
+            TensorInstr::Tanh(r)      => format!("{out} = tanh({})", r.name(num_regs)),
+            TensorInstr::SumAll(r)    => format!("{out} = sum({})  # → [1,1]", r.name(num_regs)),
+            TensorInstr::MeanAll(r)   => format!("{out} = mean({})  # → [1,1]", r.name(num_regs)),
+            TensorInstr::Transpose(r) => format!("{out} = {}.T", r.name(num_regs)),
+            TensorInstr::Clamp(r)     => format!("{out} = clamp({}, -1e6, 1e6)", r.name(num_regs)),
+        }
+    }
+}
+
+// ─── SSA diff instruction ────────────────────────────────────────────────────
+
+/// SSA instruction for autograd programs.
+///
+/// `Leaf(u8)` introduces a new `requires_grad` input tensor (the `u8` selects
+/// seed data from the seed pool, or aliases a register when `max_leaves` is
+/// reached).  All other variants consume register operands and produce a new
+/// register value.
 #[derive(Arbitrary, Debug, Clone)]
 pub enum DiffOp {
-    // --- binary: t ⊕ ref ---
-    Add(TensorRef),
-    Sub(TensorRef),
-    Mul(TensorRef),
-    // --- unary elementwise ---
-    Neg,
-    Abs,
-    Exp,
-    Log,
-    Sqrt,
+    /// Introduce a new leaf input.
+    Leaf(u8),
+    // --- binary: result = reg ⊕ reg ---
+    Add(Reg, Reg),
+    Sub(Reg, Reg),
+    Mul(Reg, Reg),
+    // --- unary ---
+    Neg(Reg),
+    Abs(Reg),
+    Exp(Reg),
+    Log(Reg),
+    Sqrt(Reg),
     // --- activations ---
-    Relu,
-    Sigmoid,
-    Tanh,
-    // --- reductions (output becomes [1, 1] for all following ops) ---
-    SumAll,
-    MeanAll,
-    // --- guard against runaway values ---
-    Clamp,
+    Relu(Reg),
+    Sigmoid(Reg),
+    Tanh(Reg),
+    // --- reductions ---
+    SumAll(Reg),
+    MeanAll(Reg),
+    // --- guard ---
+    Clamp(Reg),
 }
 
 impl DiffOp {
-    pub fn ssa_line(&self, out: &str, inp: &str) -> String {
+    /// Pretty-print one SSA line.
+    /// `num_regs` = how many registers are defined *before* this instruction.
+    /// For `Leaf`, a placeholder is printed; callers should override.
+    pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {
         match self {
-            DiffOp::Add(r)  => format!("{out} = {inp} + {r}"),
-            DiffOp::Sub(r)  => format!("{out} = {inp} - {r}"),
-            DiffOp::Mul(r)  => format!("{out} = {inp} * {r}"),
-            DiffOp::Neg     => format!("{out} = -{inp}"),
-            DiffOp::Abs     => format!("{out} = abs({inp})"),
-            DiffOp::Exp     => format!("{out} = exp({inp})"),
-            DiffOp::Log     => format!("{out} = log({inp})"),
-            DiffOp::Sqrt    => format!("{out} = sqrt({inp})"),
-            DiffOp::Relu    => format!("{out} = relu({inp})"),
-            DiffOp::Sigmoid => format!("{out} = sigmoid({inp})"),
-            DiffOp::Tanh    => format!("{out} = tanh({inp})"),
-            DiffOp::SumAll  => format!("{out} = sum({inp})  # → [1,1]"),
-            DiffOp::MeanAll => format!("{out} = mean({inp})  # → [1,1]"),
-            DiffOp::Clamp   => format!("{out} = clamp({inp}, -1e6, 1e6)"),
+            DiffOp::Leaf(_)       => format!("{out} = leaf()  [requires_grad]"),
+            DiffOp::Add(a, b)     => format!("{out} = {} + {}", a.name(num_regs), b.name(num_regs)),
+            DiffOp::Sub(a, b)     => format!("{out} = {} - {}", a.name(num_regs), b.name(num_regs)),
+            DiffOp::Mul(a, b)     => format!("{out} = {} * {}", a.name(num_regs), b.name(num_regs)),
+            DiffOp::Neg(r)        => format!("{out} = -{}", r.name(num_regs)),
+            DiffOp::Abs(r)        => format!("{out} = abs({})", r.name(num_regs)),
+            DiffOp::Exp(r)        => format!("{out} = exp({})", r.name(num_regs)),
+            DiffOp::Log(r)        => format!("{out} = log({})", r.name(num_regs)),
+            DiffOp::Sqrt(r)       => format!("{out} = sqrt({})", r.name(num_regs)),
+            DiffOp::Relu(r)       => format!("{out} = relu({})", r.name(num_regs)),
+            DiffOp::Sigmoid(r)    => format!("{out} = sigmoid({})", r.name(num_regs)),
+            DiffOp::Tanh(r)       => format!("{out} = tanh({})", r.name(num_regs)),
+            DiffOp::SumAll(r)     => format!("{out} = sum({})  # → [1,1]", r.name(num_regs)),
+            DiffOp::MeanAll(r)    => format!("{out} = mean({})  # → [1,1]", r.name(num_regs)),
+            DiffOp::Clamp(r)      => format!("{out} = clamp({}, -1e6, 1e6)", r.name(num_regs)),
         }
     }
 }

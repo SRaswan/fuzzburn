@@ -1,11 +1,12 @@
 /// Burn autograd example
+/// cargo run --example simple_autograd
 
 use burn::backend::{Autodiff, LibTorch, NdArray};
 use burn::backend::libtorch::LibTorchDevice;
 use burn::tensor::{backend::AutodiffBackend, Tensor};
 
 fn run<B: AutodiffBackend<FloatElem = f32>>(device: &B::Device, label: &str) {
-    let x_0: Tensor<B, 2> = Tensor::full([16, 2], 0.5_f32, device).require_grad();
+    let x_0: Tensor<B, 2> = Tensor::full([4140, 1], 0.1234_f32, device).require_grad();
 
     let t0 = x_0.clone();
     let t1 = t0.log();

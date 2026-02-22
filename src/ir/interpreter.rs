@@ -262,11 +262,14 @@ fn step_diff<AB: AutodiffBackend>(
             t.clone() * rhs
         }
         DiffOp::Neg     => t.neg(),
+        DiffOp::Abs     => t.abs(),
         DiffOp::Exp     => t.exp(),
         DiffOp::Log     => t.log(),
         DiffOp::Sqrt    => t.sqrt(),
+        DiffOp::Relu    => activation::relu(t),
         DiffOp::Sigmoid => activation::sigmoid(t),
         DiffOp::Tanh    => activation::tanh(t),
+        DiffOp::MeanAll => t.mean().unsqueeze::<2>(),
         DiffOp::SumAll  => t.sum().unsqueeze::<2>(),
         DiffOp::Clamp   => t.clamp(-1e6_f32, 1e6_f32),
     }
@@ -302,9 +305,9 @@ fn collect_grads<AB: AutodiffBackend>(
 pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) {
     let display = prog.ssa(config.max_leaves);
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
+        let nd = collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
         #[cfg(feature = "oracle-tch")]
-        run_autograd_oracle(prog, config);
+        run_autograd_oracle(prog, config, nd);
     }));
     if let Err(e) = result {
         handle_crash(e, &display, "fuzz_autograd", config.mode);
@@ -324,8 +327,7 @@ type DiffTch = Autodiff<LibTorch>;
 /// didn't — that is itself a bug.  Value mismatches use the same
 /// relative+absolute tolerance as the single-op oracle (`1e-4 × scale`).
 #[cfg(feature = "oracle-tch")]
-fn run_autograd_oracle(prog: &AutogradProgram, config: &FuzzConfig) {
-    let nd = collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
+fn run_autograd_oracle(prog: &AutogradProgram, config: &FuzzConfig, nd: Vec<Vec<f32>>) {
     let lt = collect_grads::<DiffTch>(prog, config, &LibTorchDevice::Cpu);
     if nd.len() != lt.len() {
         panic!(

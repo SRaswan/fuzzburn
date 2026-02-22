@@ -103,7 +103,6 @@ impl fmt::Display for TensorProgram {
 pub struct AutogradProgram {
     pub rows: u8,
     pub cols: u8,
-    /// Length may differ from config
     pub leaves: Vec<Vec<u8>>,
     pub ops: Vec<DiffOp>,
 }

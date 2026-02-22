@@ -72,10 +72,13 @@ cargo run --example simple_autograd
 
 ```sh
 # Fuzz the plain tensor API (shape ops, activations, reductions)
-cargo fuzz run fuzz_tensor_ops
+cargo +nightly fuzz run fuzz_tensor_ops
 
 # Fuzz the autodiff backend (backward pass, gradient correctness)
-cargo fuzz run fuzz_autograd
+cargo +nightly fuzz run fuzz_autograd
+
+# Fuzz autodiff with LibTorch oracle comparison
+cargo +nightly fuzz run fuzz_autograd --features oracle-tch
 ```
 
 Useful flags:

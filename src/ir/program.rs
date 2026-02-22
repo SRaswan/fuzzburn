@@ -2,7 +2,7 @@
 
 use std::fmt;
 use arbitrary::Arbitrary;
-use super::ops::{DiffOp, TensorOp, TensorInstr};
+use super::ops::{DiffOp, TensorInstr};
 
 // ─── harness mode ─────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -16,12 +16,14 @@ pub enum HarnessMode {
 pub struct FuzzConfig {
     /// Upper bound on the number of distinct leaf tensors that may be introduced
     pub max_leaves: usize,
+    /// Minimum number of ops a program must have; smaller inputs are skipped.
+    pub min_ops: usize,
     pub mode: HarnessMode,
 }
 
 impl Default for FuzzConfig {
     fn default() -> Self {
-        FuzzConfig { max_leaves: 4, mode: HarnessMode::PanicOnFirstError }
+        FuzzConfig { max_leaves: 4, min_ops: 0, mode: HarnessMode::PanicOnFirstError }
     }
 }
 
@@ -33,6 +35,11 @@ impl FuzzConfig {
             .unwrap_or(4)
             .clamp(1, 8);
 
+        let min_ops = std::env::var("MIN_OPS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+
         let mode = match std::env::var("MODE")
             .unwrap_or_default()
             .to_lowercase()
@@ -41,31 +48,8 @@ impl FuzzConfig {
             "continuous" => HarnessMode::Continuous,
             _ => HarnessMode::PanicOnFirstError,
         };
-        println!("FuzzConfig: max_leaves={}, mode={:?}", max_leaves, mode);
 
-        FuzzConfig { max_leaves, mode }
-    }
-}
-
-// ─── single-op test case ──────────────────────────────────────────────────────
-
-#[derive(Arbitrary, Debug)]
-pub struct SingleOpCase {
-    pub rows: u8,
-    pub cols: u8,
-    pub lhs: Vec<u8>,
-    pub rhs: Vec<u8>,
-    pub op: TensorOp,
-}
-
-impl fmt::Display for SingleOpCase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rows = (self.rows as usize).clamp(1, 16);
-        let cols = (self.cols as usize).clamp(1, 16);
-        writeln!(f, "=== SingleOpCase [{}×{}] ===", rows, cols)?;
-        writeln!(f, "a = input({}×{}, {} seed bytes)", rows, cols, self.lhs.len())?;
-        writeln!(f, "b = input({}×{}, {} seed bytes)", rows, cols, self.rhs.len())?;
-        write!(f, "{}", self.op.ssa_line("result", "a"))
+        FuzzConfig { max_leaves, min_ops, mode }
     }
 }
 
@@ -145,25 +129,26 @@ impl AutogradProgram {
         for op in &self.ops {
             let out = format!("r{}", num_regs);
             match op {
-                DiffOp::Leaf(seed_idx) => {
+                DiffOp::Leaf { seed, rows: lr, cols: lc } => {
                     if leaf_count < max_leaves {
                         let pool_idx = if self.leaf_seeds.is_empty() {
                             0
                         } else {
-                            *seed_idx as usize % self.leaf_seeds.len()
+                            *seed as usize % self.leaf_seeds.len()
                         };
                         let seed_len =
                             self.leaf_seeds.get(pool_idx).map(|v| v.len()).unwrap_or(0);
+                        let leaf_rows = (*lr as usize).clamp(1, 16);
+                        let leaf_cols = (*lc as usize).clamp(1, 16);
                         let _ = writeln!(
                             s,
-                            "{out} = leaf({}×{}, {seed_len} seed bytes)  \
+                            "{out} = leaf({leaf_rows}×{leaf_cols}, {seed_len} seed bytes)  \
                              [requires_grad, leaf #{leaf_count}]",
-                            rows, cols
                         );
                         leaf_reg_indices.push(num_regs);
                         leaf_count += 1;
                     } else {
-                        let src = (*seed_idx as usize) % num_regs;
+                        let src = (*seed as usize) % num_regs;
                         let _ = writeln!(
                             s,
                             "{out} = r{src}  # leaf cap reached, alias"

@@ -18,13 +18,55 @@ type PlainB = NdArray;
 type DiffB = Autodiff<NdArray>;
 
 /// Cycle raw bytes and map to f32 values in [-1, 1]
-fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
-    if raw.is_empty() {
-        return vec![0.5_f32; n];
+// fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
+//     if raw.is_empty() {
+//         return vec![0.5_f32; n];
+//     }
+//     (0..n)
+//         .map(|i| raw[i % raw.len()] as f32 / 128.0 - 1.0)
+//         .collect()
+// }
+
+#[inline]
+fn dims_from_u8(rows: u8, cols: u8, config: &FuzzConfig) -> (usize, usize) {
+    let r = (rows as usize).clamp(config.min_dim, config.max_dim);
+    let c = (cols as usize).clamp(config.min_dim, config.max_dim);
+    (r, c)
+}
+
+fn nonempty_seed<'a>(raw: &'a [u8]) -> &'a [u8] {
+    // Deterministic fallback seed (length 8)
+    const FALLBACK: &[u8] = b"\x01\x02\x03\x04\x05\x06\x07\x08";
+    if raw.is_empty() { FALLBACK } else { raw }
+}
+
+pub fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
+    // deterministic seed from bytes (no deps)
+    let mut state: u64 =
+        0xD6E8_FEB8_6659_FD93u64 ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+    for &b in raw {
+        state ^= b as u64;
+        state = state.wrapping_mul(0xA076_1D64_78BD_642F);
+        state ^= state >> 32;
     }
-    (0..n)
-        .map(|i| raw[i % raw.len()] as f32 / 128.0 - 1.0)
-        .collect()
+
+    #[inline]
+    fn splitmix64(x: &mut u64) -> u64 {
+        *x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let r = splitmix64(&mut state);
+        let u = ((r >> 40) as u32) as f32 / ((1u32 << 24) as f32); // [0,1)
+        out.push(u * 2.0 - 1.0); // [-1,1)
+    }
+    out
 }
 
 /// - `PanicOnFirstError` -> resume unwind and libFuzzer records crash
@@ -70,33 +112,31 @@ fn apply_tensor_op<B: Backend>(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>, op: &Tensor
 
 // SingleOP Interpreter
 // ───────────────────────────────────────────────────────────────────
-pub fn run_single_op_case(case: &SingleOpCase, mode: HarnessMode) {
+pub fn run_single_op_case(case: &SingleOpCase, config: &FuzzConfig) {
     let display = case.to_string();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        run_single_op_case_inner(case);
+        run_single_op_case_inner(case, config);
         #[cfg(feature = "oracle-tch")]
-        run_single_op_oracle(case);
+        run_single_op_oracle(case, config);
     }));
     if let Err(e) = result {
-        handle_crash(e, &display, "fuzz_tensor_ops", mode);
+        handle_crash(e, &display, "fuzz_tensor_ops", config.mode);
     }
 }
 
-fn run_single_op_case_inner(case: &SingleOpCase) {
-    let rows = (case.rows as usize).clamp(1, 16);
-    let cols = (case.cols as usize).clamp(1, 16);
+fn run_single_op_case_inner(case: &SingleOpCase, config: &FuzzConfig) {
+    let (rows, cols) = dims_from_u8(case.rows, case.cols, config);
     let device = NdArrayDevice::default();
     let lhs = make_plain_tensor::<NdArray>(&case.lhs, rows, cols, &device);
     let rhs = make_plain_tensor::<NdArray>(&case.rhs, rows, cols, &device);
     let result = apply_tensor_op::<NdArray>(lhs, rhs, &case.op);
-    let _ = result.into_data(); // force evaluation
+    let _ = result.into_data();
 }
 
 /// run on Libtorch
 #[cfg(feature = "oracle-tch")]
-fn run_single_op_on_libtorch(case: &SingleOpCase) -> Vec<f32> {
-    let rows = (case.rows as usize).clamp(1, 16);
-    let cols = (case.cols as usize).clamp(1, 16);
+fn run_single_op_on_libtorch(case: &SingleOpCase, config: &FuzzConfig) -> Vec<f32> {
+    let (rows, cols) = dims_from_u8(case.rows, case.cols, config);
     let device = LibTorchDevice::Cpu;
     let lhs = make_plain_tensor::<LibTorch>(&case.lhs, rows, cols, &device);
     let rhs = make_plain_tensor::<LibTorch>(&case.rhs, rows, cols, &device);
@@ -128,9 +168,8 @@ fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
 
 /// compare with libtorch
 #[cfg(feature = "oracle-tch")]
-fn run_single_op_oracle(case: &SingleOpCase) {
-    let rows = (case.rows as usize).clamp(1, 16);
-    let cols = (case.cols as usize).clamp(1, 16);
+fn run_single_op_oracle(case: &SingleOpCase, config: &FuzzConfig) {
+    let (rows, cols) = dims_from_u8(case.rows, case.cols, config);
     let device = NdArrayDevice::default();
     let lhs = make_plain_tensor::<NdArray>(&case.lhs, rows, cols, &device);
     let rhs = make_plain_tensor::<NdArray>(&case.rhs, rows, cols, &device);
@@ -138,7 +177,7 @@ fn run_single_op_oracle(case: &SingleOpCase) {
         .into_data()
         .to_vec::<f32>()
         .expect("ndarray: into_data failed");
-    let libtorch_out = run_single_op_on_libtorch(case);
+    let libtorch_out = run_single_op_on_libtorch(case, config);
     compare_outputs(&ndarray_out, &libtorch_out, &format!("{:?}", case.op));
 }
 
@@ -197,7 +236,22 @@ fn step_tensor(t: Tensor<PlainB, 2>, op: &TensorOp) -> Tensor<PlainB, 2> {
 // Autograd interpreter 
 // ─────────────────────────────────────────────────────
 
-fn make_leaf<AB: AutodiffBackend>(raw: &[u8], rows: usize, cols: usize, device: &AB::Device) -> Tensor<AB, 2> {
+// fn make_leaf<AB: AutodiffBackend>(raw: &[u8], rows: usize, cols: usize, device: &AB::Device) -> Tensor<AB, 2> {
+//     Tensor::<AB, 1>::from_floats(
+//         bytes_to_floats(raw, rows * cols).as_slice(),
+//         device,
+//     )
+//     .reshape([rows, cols])
+//     .require_grad()
+// }
+
+fn make_leaf<AB: AutodiffBackend>(
+    raw: &[u8],
+    rows: usize,
+    cols: usize,
+    device: &AB::Device,
+) -> Tensor<AB, 2> {
+    let raw = nonempty_seed(raw);
     Tensor::<AB, 1>::from_floats(
         bytes_to_floats(raw, rows * cols).as_slice(),
         device,
@@ -228,7 +282,7 @@ fn resolve_ref<AB: AutodiffBackend>(
             if new_count > leaf_stack.len() {
                 // Introduce a new leaf at position `idx` (= old stack length).
                 let raw = leaf_data.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                leaf_stack.push(make_leaf::<AB>(raw, rows, cols, device));
+                leaf_stack.push(make_leaf::<AB>(nonempty_seed(raw), rows, cols, device));
             }
             leaf_stack[idx].clone()
         }
@@ -262,11 +316,14 @@ fn step_diff<AB: AutodiffBackend>(
             t.clone() * rhs
         }
         DiffOp::Neg     => t.neg(),
+        DiffOp::Abs     => t.abs(),
         DiffOp::Exp     => t.exp(),
         DiffOp::Log     => t.log(),
         DiffOp::Sqrt    => t.sqrt(),
+        DiffOp::Relu    => activation::relu(t),
         DiffOp::Sigmoid => activation::sigmoid(t),
         DiffOp::Tanh    => activation::tanh(t),
+        DiffOp::MeanAll => t.mean().unsqueeze::<2>(),
         DiffOp::SumAll  => t.sum().unsqueeze::<2>(),
         DiffOp::Clamp   => t.clamp(-1e6_f32, 1e6_f32),
     }
@@ -279,9 +336,11 @@ fn collect_grads<AB: AutodiffBackend>(
     config: &FuzzConfig,
     device: &AB::Device,
 ) -> Vec<Vec<f32>> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
+    // let rows = (prog.rows as usize).clamp(1, 16);
+    // let cols = (prog.cols as usize).clamp(1, 16);
 
+    let (rows, cols) = dims_from_u8(prog.rows, prog.cols, config);
+    
     let leaf_0 = make_leaf::<AB>(prog.leaves.get(0).map(Vec::as_slice).unwrap_or(&[]), rows, cols, device);
     let mut leaf_stack: Vec<Tensor<AB, 2>> = vec![leaf_0.clone()];
     let mut t = leaf_0;
@@ -300,11 +359,11 @@ fn collect_grads<AB: AutodiffBackend>(
 
 /// run AutogradProgram against Autodiff<NdArray> backend
 pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) {
-    let display = prog.ssa(config.max_leaves);
+    let display = prog.ssa(config);
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
+        let nd = collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
         #[cfg(feature = "oracle-tch")]
-        run_autograd_oracle(prog, config);
+        run_autograd_oracle(prog, config, nd);    
     }));
     if let Err(e) = result {
         handle_crash(e, &display, "fuzz_autograd", config.mode);
@@ -324,8 +383,7 @@ type DiffTch = Autodiff<LibTorch>;
 /// didn't — that is itself a bug.  Value mismatches use the same
 /// relative+absolute tolerance as the single-op oracle (`1e-4 × scale`).
 #[cfg(feature = "oracle-tch")]
-fn run_autograd_oracle(prog: &AutogradProgram, config: &FuzzConfig) {
-    let nd = collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
+fn run_autograd_oracle(prog: &AutogradProgram, config: &FuzzConfig, nd: Vec<Vec<f32>>) {
     let lt = collect_grads::<DiffTch>(prog, config, &LibTorchDevice::Cpu);
     if nd.len() != lt.len() {
         panic!(

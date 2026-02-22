@@ -1,6 +1,3 @@
-//! Instructions for fuzz IR.
-//! TensorRef is the "operand" type for binary ops
-
 use std::fmt;
 use arbitrary::Arbitrary;
 
@@ -25,6 +22,7 @@ impl TensorRef {
                     (0, 1)
                 } else if num_available == 0 {
                     // Stack full: must reuse
+                    // TODO: possibly bug for not resuing an input??
                     (raw % num_used, num_used)
                 } else {
                     // Reuse var probability = num_used / (num_used + num_avail)
@@ -121,17 +119,20 @@ pub enum DiffOp {
     Add(TensorRef),
     Sub(TensorRef),
     Mul(TensorRef),
-    // --- unary ---
+    // --- unary elementwise ---
     Neg,
+    Abs,
     Exp,
     Log,
     Sqrt,
     // --- activations ---
+    Relu,
     Sigmoid,
     Tanh,
-    // --- reduction ---
+    // --- reductions (output becomes [1, 1] for all following ops) ---
     SumAll,
-    // --- guard ---
+    MeanAll,
+    // --- guard against runaway values ---
     Clamp,
 }
 
@@ -142,12 +143,15 @@ impl DiffOp {
             DiffOp::Sub(r)  => format!("{out} = {inp} - {r}"),
             DiffOp::Mul(r)  => format!("{out} = {inp} * {r}"),
             DiffOp::Neg     => format!("{out} = -{inp}"),
+            DiffOp::Abs     => format!("{out} = abs({inp})"),
             DiffOp::Exp     => format!("{out} = exp({inp})"),
             DiffOp::Log     => format!("{out} = log({inp})"),
             DiffOp::Sqrt    => format!("{out} = sqrt({inp})"),
+            DiffOp::Relu    => format!("{out} = relu({inp})"),
             DiffOp::Sigmoid => format!("{out} = sigmoid({inp})"),
             DiffOp::Tanh    => format!("{out} = tanh({inp})"),
             DiffOp::SumAll  => format!("{out} = sum({inp})  # → [1,1]"),
+            DiffOp::MeanAll => format!("{out} = mean({inp})  # → [1,1]"),
             DiffOp::Clamp   => format!("{out} = clamp({inp}, -1e6, 1e6)"),
         }
     }

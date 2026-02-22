@@ -4,7 +4,7 @@ use std::panic;
 use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::{Autodiff, NdArray};
 use burn::tensor::{activation, Tensor};
-use burn::tensor::backend::Backend;
+use burn::tensor::backend::{AutodiffBackend, Backend};
 
 #[cfg(feature = "oracle-tch")]
 use burn::backend::LibTorch;
@@ -199,51 +199,8 @@ fn step_tensor(t: Tensor<PlainB, 2>, op: &TensorOp) -> Tensor<PlainB, 2> {
 // Autograd interpreter 
 // ─────────────────────────────────────────────────────
 
-/// run AutogradProgram against Autodiff<NdArray> backend
-pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) {
-    let display = prog.ssa(config.max_leaves);
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        run_autograd_program_inner(prog, config);
-        // With oracle-tch: re-run on LibTorch, compare gradient values.
-        #[cfg(feature = "oracle-tch")]
-        run_autograd_oracle(prog, config);
-    }));
-    if let Err(e) = result {
-        handle_crash(e, &display, "fuzz_autograd", config.mode);
-    }
-}
-
-fn run_autograd_program_inner(prog: &AutogradProgram, config: &FuzzConfig) {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
-    let device = NdArrayDevice::default();
-
-    // x_0 accumulator seed
-    let leaf_0 = make_leaf(
-        prog.leaves.get(0).map(Vec::as_slice).unwrap_or(&[]),
-        rows, cols, &device,
-    );
-    let mut leaf_stack: Vec<Tensor<DiffB, 2>> = vec![leaf_0.clone()];
-    let mut t: Tensor<DiffB, 2> = leaf_0;
-
-    // Run op sequence
-    // bin ops grow leaf_stack to build DAG
-    for op in &prog.ops {
-        t = step_diff(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, &device);
-    }
-
-    let grads = t.backward();
-
-    // check if there is missing gradient for any leaf actually used
-    for (i, leaf) in leaf_stack.iter().enumerate() {
-        if leaf.grad(&grads).is_none() {
-            panic!("grad of leaf x_{i} missing after backward()");
-        }
-    }
-}
-
-fn make_leaf(raw: &[u8], rows: usize, cols: usize, device: &NdArrayDevice) -> Tensor<DiffB, 2> {
-    Tensor::<DiffB, 1>::from_floats(
+fn make_leaf<AB: AutodiffBackend>(raw: &[u8], rows: usize, cols: usize, device: &AB::Device) -> Tensor<AB, 2> {
+    Tensor::<AB, 1>::from_floats(
         bytes_to_floats(raw, rows * cols).as_slice(),
         device,
     )
@@ -257,23 +214,23 @@ fn make_leaf(raw: &[u8], rows: usize, cols: usize, device: &NdArrayDevice) -> Te
 /// - `TensorRef::Leaf(raw)` → reuse or introduce a leaf via
 ///   [`TensorRef::dispatch_leaf_idx`], growing `leaf_stack` when a new leaf used
 ///   is introduced.
-fn resolve_ref(
+fn resolve_ref<AB: AutodiffBackend>(
     r: &TensorRef,
-    t: &Tensor<DiffB, 2>,
-    leaf_stack: &mut Vec<Tensor<DiffB, 2>>,
+    t: &Tensor<AB, 2>,
+    leaf_stack: &mut Vec<Tensor<AB, 2>>,
     leaf_data: &[Vec<u8>],
     max_leaves: usize,
     rows: usize,
     cols: usize,
-    device: &NdArrayDevice,
-) -> Tensor<DiffB, 2> {
+    device: &AB::Device,
+) -> Tensor<AB, 2> {
     match r.dispatch_leaf_idx(leaf_stack.len(), max_leaves) {
         None => t.clone(), // TensorRef::Current
         Some((idx, new_count)) => {
             if new_count > leaf_stack.len() {
                 // Introduce a new leaf at position `idx` (= old stack length).
                 let raw = leaf_data.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                leaf_stack.push(make_leaf(raw, rows, cols, device));
+                leaf_stack.push(make_leaf::<AB>(raw, rows, cols, device));
             }
             leaf_stack[idx].clone()
         }
@@ -283,16 +240,16 @@ fn resolve_ref(
 /// Single-step evaluation for one [`DiffOp`].
 ///
 /// Binary ops call [`resolve_ref`], which may grow `leaf_stack`.
-fn step_diff(
-    t: Tensor<DiffB, 2>,
+fn step_diff<AB: AutodiffBackend>(
+    t: Tensor<AB, 2>,
     op: &DiffOp,
-    leaf_stack: &mut Vec<Tensor<DiffB, 2>>,
+    leaf_stack: &mut Vec<Tensor<AB, 2>>,
     leaf_data: &[Vec<u8>],
     max_leaves: usize,
     rows: usize,
     cols: usize,
-    device: &NdArrayDevice,
-) -> Tensor<DiffB, 2> {
+    device: &AB::Device,
+) -> Tensor<AB, 2> {
     match op {
         DiffOp::Add(r) => {
             let rhs = resolve_ref(r, &t, leaf_stack, leaf_data, max_leaves, rows, cols, device);
@@ -314,6 +271,45 @@ fn step_diff(
         DiffOp::Tanh    => activation::tanh(t),
         DiffOp::SumAll  => t.sum().unsqueeze::<2>(),
         DiffOp::Clamp   => t.clamp(-1e6_f32, 1e6_f32),
+    }
+}
+
+/// Run `prog` on any autodiff backend, returning gradient data for every leaf
+/// in stack order.  Panics if any leaf is missing a gradient.
+fn collect_grads<AB: AutodiffBackend>(
+    prog: &AutogradProgram,
+    config: &FuzzConfig,
+    device: &AB::Device,
+) -> Vec<Vec<f32>> {
+    let rows = (prog.rows as usize).clamp(1, 16);
+    let cols = (prog.cols as usize).clamp(1, 16);
+
+    let leaf_0 = make_leaf::<AB>(prog.leaves.get(0).map(Vec::as_slice).unwrap_or(&[]), rows, cols, device);
+    let mut leaf_stack: Vec<Tensor<AB, 2>> = vec![leaf_0.clone()];
+    let mut t = leaf_0;
+    for op in &prog.ops {
+        t = step_diff(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, device);
+    }
+    let grads = t.backward();
+    leaf_stack.iter().enumerate().map(|(i, leaf)| {
+        leaf.grad(&grads)
+            .unwrap_or_else(|| panic!("grad of leaf x_{i} missing after backward()"))
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap_or_else(|e| panic!("into_data for x_{i} grad failed: {e}"))
+    }).collect()
+}
+
+/// run AutogradProgram against Autodiff<NdArray> backend
+pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) {
+    let display = prog.ssa(config.max_leaves);
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
+        #[cfg(feature = "oracle-tch")]
+        run_autograd_oracle(prog, config);
+    }));
+    if let Err(e) = result {
+        handle_crash(e, &display, "fuzz_autograd", config.mode);
     }
 }
 
@@ -323,127 +319,6 @@ fn step_diff(
 #[cfg(feature = "oracle-tch")]
 type DiffTch = Autodiff<LibTorch>;
 
-/// Build one `requires_grad` leaf on the LibTorch backend.
-#[cfg(feature = "oracle-tch")]
-fn make_leaf_tch(raw: &[u8], rows: usize, cols: usize, device: &LibTorchDevice) -> Tensor<DiffTch, 2> {
-    Tensor::<DiffTch, 1>::from_floats(
-        bytes_to_floats(raw, rows * cols).as_slice(),
-        device,
-    )
-    .reshape([rows, cols])
-    .require_grad()
-}
-
-/// [`resolve_ref`] counterpart for the LibTorch backend.
-#[cfg(feature = "oracle-tch")]
-fn resolve_ref_tch(
-    r: &TensorRef,
-    t: &Tensor<DiffTch, 2>,
-    leaf_stack: &mut Vec<Tensor<DiffTch, 2>>,
-    leaf_data: &[Vec<u8>],
-    max_leaves: usize,
-    rows: usize,
-    cols: usize,
-    device: &LibTorchDevice,
-) -> Tensor<DiffTch, 2> {
-    match r.dispatch_leaf_idx(leaf_stack.len(), max_leaves) {
-        None => t.clone(),
-        Some((idx, new_count)) => {
-            if new_count > leaf_stack.len() {
-                let raw = leaf_data.get(idx).map(Vec::as_slice).unwrap_or(&[]);
-                leaf_stack.push(make_leaf_tch(raw, rows, cols, device));
-            }
-            leaf_stack[idx].clone()
-        }
-    }
-}
-
-/// [`step_diff`] counterpart for the LibTorch backend.
-#[cfg(feature = "oracle-tch")]
-fn step_diff_tch(
-    t: Tensor<DiffTch, 2>,
-    op: &DiffOp,
-    leaf_stack: &mut Vec<Tensor<DiffTch, 2>>,
-    leaf_data: &[Vec<u8>],
-    max_leaves: usize,
-    rows: usize,
-    cols: usize,
-    device: &LibTorchDevice,
-) -> Tensor<DiffTch, 2> {
-    match op {
-        DiffOp::Add(r) => {
-            let rhs = resolve_ref_tch(r, &t, leaf_stack, leaf_data, max_leaves, rows, cols, device);
-            t.clone() + rhs
-        }
-        DiffOp::Sub(r) => {
-            let rhs = resolve_ref_tch(r, &t, leaf_stack, leaf_data, max_leaves, rows, cols, device);
-            t.clone() - rhs
-        }
-        DiffOp::Mul(r) => {
-            let rhs = resolve_ref_tch(r, &t, leaf_stack, leaf_data, max_leaves, rows, cols, device);
-            t.clone() * rhs
-        }
-        DiffOp::Neg     => t.neg(),
-        DiffOp::Exp     => t.exp(),
-        DiffOp::Log     => t.log(),
-        DiffOp::Sqrt    => t.sqrt(),
-        DiffOp::Sigmoid => activation::sigmoid(t),
-        DiffOp::Tanh    => activation::tanh(t),
-        DiffOp::SumAll  => t.sum().unsqueeze::<2>(),
-        DiffOp::Clamp   => t.clamp(-1e6_f32, 1e6_f32),
-    }
-}
-
-/// Run `prog` on NdArray, return gradient data for every leaf in stack order.
-///
-/// Panics if any leaf has no gradient (consistent with
-/// [`run_autograd_program_inner`] — this will never be reached if the main
-/// run already passed).
-#[cfg(feature = "oracle-tch")]
-fn collect_grads_ndarray(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<Vec<f32>> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
-    let device = NdArrayDevice::default();
-
-    let leaf_0 = make_leaf(prog.leaves.get(0).map(Vec::as_slice).unwrap_or(&[]), rows, cols, &device);
-    let mut leaf_stack: Vec<Tensor<DiffB, 2>> = vec![leaf_0.clone()];
-    let mut t = leaf_0;
-    for op in &prog.ops {
-        t = step_diff(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, &device);
-    }
-    let grads = t.backward();
-    leaf_stack.iter().enumerate().map(|(i, leaf)| {
-        leaf.grad(&grads)
-            .unwrap_or_else(|| panic!("oracle(ndarray): grad of x_{i} is None"))
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap_or_else(|e| panic!("oracle(ndarray): into_data for x_{i} grad failed: {e}"))
-    }).collect()
-}
-
-/// Run `prog` on LibTorch, return gradient data for every leaf in stack order.
-#[cfg(feature = "oracle-tch")]
-fn collect_grads_libtorch(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<Vec<f32>> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
-    let device = LibTorchDevice::Cpu;
-
-    let leaf_0 = make_leaf_tch(prog.leaves.get(0).map(Vec::as_slice).unwrap_or(&[]), rows, cols, &device);
-    let mut leaf_stack: Vec<Tensor<DiffTch, 2>> = vec![leaf_0.clone()];
-    let mut t = leaf_0;
-    for op in &prog.ops {
-        t = step_diff_tch(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, &device);
-    }
-    let grads = t.backward();
-    leaf_stack.iter().enumerate().map(|(i, leaf)| {
-        leaf.grad(&grads)
-            .unwrap_or_else(|| panic!("oracle(libtorch): grad of x_{i} is None"))
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap_or_else(|e| panic!("oracle(libtorch): into_data for x_{i} grad failed: {e}"))
-    }).collect()
-}
-
 /// Compare autograd outputs between NdArray and LibTorch.
 ///
 /// Both backends run the same [`AutogradProgram`] with identical leaf seeds.
@@ -452,8 +327,8 @@ fn collect_grads_libtorch(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<Ve
 /// relative+absolute tolerance as the single-op oracle (`1e-4 × scale`).
 #[cfg(feature = "oracle-tch")]
 fn run_autograd_oracle(prog: &AutogradProgram, config: &FuzzConfig) {
-    let nd = collect_grads_ndarray(prog, config);
-    let lt = collect_grads_libtorch(prog, config);
+    let nd = collect_grads::<DiffB>(prog, config, &NdArrayDevice::default());
+    let lt = collect_grads::<DiffTch>(prog, config, &LibTorchDevice::Cpu);
     if nd.len() != lt.len() {
         panic!(
             "autograd oracle: NdArray produced {} leaf gradients, LibTorch produced {}",

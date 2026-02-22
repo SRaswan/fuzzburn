@@ -10,7 +10,7 @@ fn run<B: AutodiffBackend<FloatElem = f32>>(device: &B::Device, label: &str) {
 
     let t0 = x_0.clone();
     let t1 = t0.clone().transpose();
-    let t2 = t1 + t0.clone();
+    let t2 = t1.clone() + t0.clone();
     let grads = t2.backward();
 
     let x_grad = x_0.grad(&grads).unwrap();

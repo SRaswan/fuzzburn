@@ -69,6 +69,40 @@ impl FuzzConfig {
     }
 }
 
+// ─── single-op test case ──────────────────────────────────────────────────────
+
+/// One tensor operation applied to two independently seeded input tensors.
+///
+/// Binary ops (`Add`, `Sub`, `Mul`) receive distinct `lhs` and `rhs` data,
+/// so they genuinely exercise two-argument behaviour instead of `t ⊕ t`.
+/// Unary ops and reductions use only `lhs`; `rhs` is generated but ignored,
+/// keeping the `Arbitrary` derivation simple and the corpus bytes useful
+/// should an op later be promoted to binary.
+///
+/// When compiled with `--features oracle-tch` the interpreter also runs the
+/// same op on the LibTorch (PyTorch) backend and compares outputs element-wise.
+#[derive(Arbitrary, Debug)]
+pub struct SingleOpCase {
+    pub rows: u8,
+    pub cols: u8,
+    /// Seed bytes for the left-hand (or only) input tensor.
+    pub lhs: Vec<u8>,
+    /// Seed bytes for the right-hand input tensor (binary ops only).
+    pub rhs: Vec<u8>,
+    pub op: TensorOp,
+}
+
+impl fmt::Display for SingleOpCase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rows = (self.rows as usize).clamp(1, 16);
+        let cols = (self.cols as usize).clamp(1, 16);
+        writeln!(f, "=== SingleOpCase [{}×{}] ===", rows, cols)?;
+        writeln!(f, "a = input({}×{}, {} seed bytes)", rows, cols, self.lhs.len())?;
+        writeln!(f, "b = input({}×{}, {} seed bytes)", rows, cols, self.rhs.len())?;
+        write!(f, "{}", self.op.ssa_line("result", "a"))
+    }
+}
+
 // ─── plain tensor program ─────────────────────────────────────────────────────
 
 #[derive(Arbitrary, Debug)]

@@ -5,4 +5,4 @@ pub mod ops;
 pub mod program;
 
 // Convenience re-exports so fuzz targets can write `fuzzburn::ir::FuzzConfig`.
-pub use program::{FuzzConfig, HarnessMode};
+pub use program::{FuzzConfig, HarnessMode, SingleOpCase};

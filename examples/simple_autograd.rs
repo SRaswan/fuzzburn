@@ -1,4 +1,4 @@
-/// Minimal Burn autograd example: y = x^2, compute dy/dx at x=2.0
+/// Burn autograd example
 use burn::backend::{Autodiff, NdArray};
 use burn::tensor::Tensor;
 

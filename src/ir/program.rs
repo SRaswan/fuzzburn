@@ -1,7 +1,9 @@
 //! Root AST nodes and runtime configuration for fuzz programs.
 
 use std::fmt;
+
 use arbitrary::Arbitrary;
+
 use super::ops::{DiffOp, TensorInstr};
 
 // ─── harness mode ─────────────────────────────────────────────────────────────
@@ -19,11 +21,20 @@ pub struct FuzzConfig {
     /// Minimum number of ops a program must have; smaller inputs are skipped.
     pub min_ops: usize,
     pub mode: HarnessMode,
+
+    pub min_dim: usize,
+    pub max_dim: usize,
 }
 
 impl Default for FuzzConfig {
     fn default() -> Self {
-        FuzzConfig { max_leaves: 4, min_ops: 0, mode: HarnessMode::PanicOnFirstError }
+        FuzzConfig {
+            max_leaves: 4,
+            min_ops: 0,
+            mode: HarnessMode::PanicOnFirstError,
+            min_dim: 1,
+            max_dim: 16,
+        }
     }
 }
 
@@ -49,7 +60,25 @@ impl FuzzConfig {
             _ => HarnessMode::PanicOnFirstError,
         };
 
-        FuzzConfig { max_leaves, min_ops, mode }
+        let min_dim = std::env::var("FUZZ_MIN_DIM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 4096);
+
+        let max_dim = std::env::var("FUZZ_MAX_DIM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16)
+            .clamp(min_dim, 4096);
+
+        FuzzConfig {
+            max_leaves,
+            min_ops,
+            mode,
+            min_dim,
+            max_dim,
+        }
     }
 }
 
@@ -65,19 +94,32 @@ pub struct TensorProgram {
     pub ops: Vec<TensorInstr>,
 }
 
-impl fmt::Display for TensorProgram {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rows = (self.rows as usize).clamp(1, 16);
-        let cols = (self.cols as usize).clamp(1, 16);
-        writeln!(f, "=== TensorProgram [{}×{}] ===", rows, cols)?;
-        writeln!(f, "r0 = input({}×{}, {} seed bytes)", rows, cols, self.values.len())?;
+impl TensorProgram {
+    pub fn ssa(&self, config: &FuzzConfig) -> String {
+        use std::fmt::Write;
+
+        let rows = (self.rows as usize).clamp(config.min_dim, config.max_dim);
+        let cols = (self.cols as usize).clamp(config.min_dim, config.max_dim);
+
+        let mut s = String::new();
+        let _ = writeln!(s, "=== TensorProgram [{}×{}] ===", rows, cols);
+        let _ = writeln!(s, "r0 = input({}×{}, {} seed bytes)", rows, cols, self.values.len());
+
         let mut num_regs: usize = 1;
         for instr in &self.ops {
             let out = format!("r{}", num_regs);
-            writeln!(f, "{}", instr.ssa_line(&out, num_regs))?;
+            let _ = writeln!(s, "{}", instr.ssa_line(&out, num_regs));
             num_regs += 1;
         }
-        write!(f, "result = r{}.into_data()", num_regs - 1)
+        let _ = write!(s, "result = r{}.into_data()", num_regs - 1);
+        s
+    }
+}
+
+impl fmt::Display for TensorProgram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = FuzzConfig::default();
+        write!(f, "{}", self.ssa(&cfg))
     }
 }
 
@@ -102,16 +144,17 @@ pub struct AutogradProgram {
 
 impl AutogradProgram {
     /// Pretty-print the program in SSA form, simulating register resolution.
-    pub fn ssa(&self, max_leaves: usize) -> String {
+    pub fn ssa(&self, config: &FuzzConfig) -> String {
         use std::fmt::Write;
-        let rows = (self.rows as usize).clamp(1, 16);
-        let cols = (self.cols as usize).clamp(1, 16);
-        let mut s = String::new();
 
+        let rows = (self.rows as usize).clamp(config.min_dim, config.max_dim);
+        let cols = (self.cols as usize).clamp(config.min_dim, config.max_dim);
+
+        let mut s = String::new();
         let _ = writeln!(
             s,
             "=== AutogradProgram [{}×{}] (max_leaves={}) ===",
-            rows, cols, max_leaves
+            rows, cols, config.max_leaves
         );
 
         // r0 = seed leaf (always present)
@@ -130,7 +173,7 @@ impl AutogradProgram {
             let out = format!("r{}", num_regs);
             match op {
                 DiffOp::Leaf { seed, rows: lr, cols: lc } => {
-                    if leaf_count < max_leaves {
+                    if leaf_count < config.max_leaves {
                         let pool_idx = if self.leaf_seeds.is_empty() {
                             0
                         } else {
@@ -138,8 +181,10 @@ impl AutogradProgram {
                         };
                         let seed_len =
                             self.leaf_seeds.get(pool_idx).map(|v| v.len()).unwrap_or(0);
-                        let leaf_rows = (*lr as usize).clamp(1, 16);
-                        let leaf_cols = (*lc as usize).clamp(1, 16);
+
+                        let leaf_rows = (*lr as usize).clamp(config.min_dim, config.max_dim);
+                        let leaf_cols = (*lc as usize).clamp(config.min_dim, config.max_dim);
+
                         let _ = writeln!(
                             s,
                             "{out} = leaf({leaf_rows}×{leaf_cols}, {seed_len} seed bytes)  \
@@ -149,10 +194,7 @@ impl AutogradProgram {
                         leaf_count += 1;
                     } else {
                         let src = (*seed as usize) % num_regs;
-                        let _ = writeln!(
-                            s,
-                            "{out} = r{src}  # leaf cap reached, alias"
-                        );
+                        let _ = writeln!(s, "{out} = r{src}  # leaf cap reached, alias");
                     }
                 }
                 _ => {
@@ -165,7 +207,10 @@ impl AutogradProgram {
         let last = num_regs - 1;
         let _ = writeln!(s, "grads = backward(r{last})");
         for &ri in &leaf_reg_indices {
-            let _ = writeln!(s, "grad r{ri} = r{ri}.grad(grads)  # None → zeros if unreachable");
+            let _ = writeln!(
+                s,
+                "grad r{ri} = r{ri}.grad(grads)  # None → zeros if unreachable"
+            );
         }
         s
     }
@@ -173,6 +218,7 @@ impl AutogradProgram {
 
 impl fmt::Display for AutogradProgram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.ssa(4))
+        let cfg = FuzzConfig::default();
+        write!(f, "{}", self.ssa(&cfg))
     }
 }

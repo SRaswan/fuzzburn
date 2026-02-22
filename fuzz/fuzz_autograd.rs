@@ -8,6 +8,28 @@
 //! collect_grads -> step_diff -> resolve_ref -> dispatch_leaf to actually step through our DAG node by node, and then resolve the reference for nodes that we need to by "indexing" based on our "leaf ID u8" 
 //! compares with run_autograd_oracle
 
+// #![no_main]
+
+// use fuzzburn::ir::{interpreter, program::AutogradProgram, FuzzConfig, HarnessMode};
+// use libfuzzer_sys::fuzz_target;
+
+// fuzz_target!(|prog: AutogradProgram| {
+//     let config = FuzzConfig::from_env();
+//     if prog.ops.len() < config.min_ops { return; }
+//     if let Err(msg) = interpreter::run_autograd_program(&prog, &config) {
+//         let display = prog.ssa(config.max_leaves);
+//         match config.mode {
+//             HarnessMode::PanicOnFirstError => {
+//                 panic!("fuzz_autograd CRASH:\n{display}\nerror: {msg}");
+//             }
+//             // TODO: maybe somehow log the terminal output to a file?
+//             HarnessMode::Continuous => {
+//                 eprintln!("\n=== CRASH (fuzz_autograd, continuing) ===\n{display}\nerror: {msg}\n");
+//             }
+//         }
+//     }
+// });
+
 #![no_main]
 
 use fuzzburn::ir::{interpreter, program::AutogradProgram, FuzzConfig, HarnessMode};
@@ -15,16 +37,23 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|prog: AutogradProgram| {
     let config = FuzzConfig::from_env();
-    if prog.ops.len() < config.min_ops { return; }
+    if prog.ops.len() < config.min_ops {
+        return;
+    }
+
     if let Err(msg) = interpreter::run_autograd_program(&prog, &config) {
-        let display = prog.ssa(config.max_leaves);
+        
+        let display = prog.ssa(&config);
+
         match config.mode {
             HarnessMode::PanicOnFirstError => {
                 panic!("fuzz_autograd CRASH:\n{display}\nerror: {msg}");
             }
             // TODO: maybe somehow log the terminal output to a file?
             HarnessMode::Continuous => {
-                eprintln!("\n=== CRASH (fuzz_autograd, continuing) ===\n{display}\nerror: {msg}\n");
+                eprintln!(
+                    "\n=== CRASH (fuzz_autograd, continuing) ===\n{display}\nerror: {msg}\n"
+                );
             }
         }
     }

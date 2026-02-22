@@ -17,8 +17,6 @@ use super::program::{AutogradProgram, FuzzConfig, HarnessMode, SingleOpCase, Ten
 type PlainB = NdArray;
 type DiffB = Autodiff<NdArray>;
 
-// HELPERS
-// ----------------------------------------------------------
 /// Cycle raw bytes and map to f32 values in [-1, 1]
 fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
     if raw.is_empty() {
@@ -37,7 +35,7 @@ fn handle_crash(e: Box<dyn std::any::Any + Send>, display: &str, target: &str, m
     eprintln!("========================================\n");
     match mode {
         HarnessMode::PanicOnFirstError => panic::resume_unwind(e),
-        HarnessMode::Continuous => { /* log only – let the fuzzer continue */ }
+        HarnessMode::Continuous => {  }
     }
 }
 

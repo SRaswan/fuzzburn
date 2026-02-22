@@ -1,19 +1,30 @@
 /// Burn autograd example
-use burn::backend::{Autodiff, NdArray};
-use burn::tensor::Tensor;
 
-type Backend = Autodiff<NdArray>;
-type Device = <NdArray as burn::tensor::backend::Backend>::Device;
+use burn::backend::{Autodiff, LibTorch, NdArray};
+use burn::backend::libtorch::LibTorchDevice;
+use burn::tensor::{backend::AutodiffBackend, Tensor};
+
+fn run<B: AutodiffBackend<FloatElem = f32>>(device: &B::Device, label: &str) {
+    let x_0: Tensor<B, 2> = Tensor::full([16, 2], 0.5_f32, device).require_grad();
+
+    let t0 = x_0.clone();
+    let t1 = t0.log();
+    let grads = t1.backward();
+
+    let x_grad = x_0.grad(&grads).unwrap();
+    // d/dx log(x) = 1/x, so we expect x_grad to be full of 2.0
+    println!("[{label}] x_0.grad = {}", x_grad.into_data());
+}
 
 fn main() {
-    let device = Device::default();
+    run::<Autodiff<NdArray>>(
+        &<NdArray as burn::tensor::backend::Backend>::Device::default(),
+        "NdArray",
+    );
 
-    let x: Tensor<Backend, 1> = Tensor::from_floats([2.0_f32], &device).require_grad();
-    let y = x.clone() * x.clone();
-
-    let grads = y.backward();
-    let x_grad = x.grad(&grads).unwrap();
-
-    println!("y = x^2,  x = 2.0");
-    println!("dy/dx = {}", x_grad.into_data()); // expected: 4.0
+    run::<Autodiff<LibTorch>>(
+        &LibTorchDevice::Cpu,
+        "LibTorch",
+    );
 }
+

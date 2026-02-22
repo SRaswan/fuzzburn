@@ -17,9 +17,9 @@ use super::program::{AutogradProgram, FuzzConfig, HarnessMode, SingleOpCase, Ten
 type PlainB = NdArray;
 type DiffB = Autodiff<NdArray>;
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
-
-/// Cycle `raw` bytes and map them to f32 values in [-1, 1].
+// HELPERS
+// ----------------------------------------------------------
+/// Cycle raw bytes and map to f32 values in [-1, 1]
 fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
     if raw.is_empty() {
         return vec![0.5_f32; n];
@@ -29,10 +29,8 @@ fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Decide what to do after catching a panic, based on `HarnessMode`.
-///
-/// - `PanicOnFirstError` → resume the unwind (libFuzzer records the crash)
-/// - `Continuous`        → log to stderr and return (fuzzer keeps running)
+/// - `PanicOnFirstError` -> resume unwind and libFuzzer records crash
+/// - `Continuous`        -> log to stderr and return (fuzzer keeps running)
 fn handle_crash(e: Box<dyn std::any::Any + Send>, display: &str, target: &str, mode: HarnessMode) {
     eprintln!("\n=== CRASH DETECTED ({target}) ===");
     eprintln!("{display}");
@@ -42,18 +40,16 @@ fn handle_crash(e: Box<dyn std::any::Any + Send>, display: &str, target: &str, m
         HarnessMode::Continuous => { /* log only – let the fuzzer continue */ }
     }
 }
-// ─── generic tensor helpers ─────────────────────────────────────────────────────────────────────
 
+// TENSOR OPS
+// ─────────────────────────────────────────────────────────────────────
 /// Build a 2-D tensor from raw seed bytes for any backend.
 fn make_plain_tensor<B: Backend>(raw: &[u8], rows: usize, cols: usize, device: &B::Device) -> Tensor<B, 2> {
     Tensor::<B, 1>::from_floats(bytes_to_floats(raw, rows * cols).as_slice(), device)
         .reshape([rows, cols])
 }
 
-/// Apply one [`TensorOp`] to `lhs` (and `rhs` for binary ops) on any backend.
-///
-/// This is generic so the same match arms are used for both the NdArray
-/// production run and the optional LibTorch oracle comparison.
+/// Apply one TensorOp to `lhs` and `rhs`
 fn apply_tensor_op<B: Backend>(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>, op: &TensorOp) -> Tensor<B, 2> {
     match op {
         TensorOp::Add       => lhs + rhs,
@@ -74,13 +70,8 @@ fn apply_tensor_op<B: Backend>(lhs: Tensor<B, 2>, rhs: Tensor<B, 2>, op: &Tensor
     }
 }
 
-// ─── single-op interpreter ───────────────────────────────────────────────────────────────────
-
-/// Execute a [`SingleOpCase`] against the NdArray backend.
-///
-/// Binary ops receive genuinely independent `lhs` / `rhs` tensors.
-/// When compiled with `--features oracle-tch`, also runs on LibTorch and
-/// compares outputs element-wise: any numerical divergence is a bug.
+// SingleOP Interpreter
+// ───────────────────────────────────────────────────────────────────
 pub fn run_single_op_case(case: &SingleOpCase, mode: HarnessMode) {
     let display = case.to_string();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -103,9 +94,7 @@ fn run_single_op_case_inner(case: &SingleOpCase) {
     let _ = result.into_data(); // force evaluation
 }
 
-// ─── LibTorch oracle (only when feature = "oracle-tch") ──────────────────────────────────────────
-
-/// Run `case` on the LibTorch backend, collect results as `Vec<f32>`.
+/// run on Libtorch
 #[cfg(feature = "oracle-tch")]
 fn run_single_op_on_libtorch(case: &SingleOpCase) -> Vec<f32> {
     let rows = (case.rows as usize).clamp(1, 16);
@@ -119,8 +108,7 @@ fn run_single_op_on_libtorch(case: &SingleOpCase) -> Vec<f32> {
         .expect("oracle: into_data failed")
 }
 
-/// Compare NdArray and LibTorch outputs.  Tolerances match pyreking/cse291y:
-/// abs(a−b) must be ≤ 1e-4 × max(|a|, |b|, 1.0).
+/// TODO: make tolerance an environmental var
 #[cfg(feature = "oracle-tch")]
 fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
     assert_eq!(ndarray.len(), libtorch.len(), "oracle shape mismatch in {label}");
@@ -140,7 +128,7 @@ fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
     }
 }
 
-/// Run a `SingleOpCase` on NdArray, run it again on LibTorch, compare.
+/// compare with libtorch
 #[cfg(feature = "oracle-tch")]
 fn run_single_op_oracle(case: &SingleOpCase) {
     let rows = (case.rows as usize).clamp(1, 16);
@@ -155,12 +143,12 @@ fn run_single_op_oracle(case: &SingleOpCase) {
     let libtorch_out = run_single_op_on_libtorch(case);
     compare_outputs(&ndarray_out, &libtorch_out, &format!("{:?}", case.op));
 }
-// ─── plain tensor interpreter ─────────────────────────────────────────────────
 
-/// Execute a [`TensorProgram`] against the plain NdArray backend.
-///
-/// `mode` controls whether a detected crash re-panics (libFuzzer records it)
-/// or is logged to stderr and execution continues.
+// plain tensor interpreter 
+// ─────────────────────────────────────────────────
+
+/// run TensorProgram against plain NdArray backend
+/// TODO: compare with libtorch
 pub fn run_tensor_program(prog: &TensorProgram, mode: HarnessMode) {
     let display = prog.to_string();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -187,8 +175,7 @@ fn run_tensor_program_inner(prog: &TensorProgram) {
     let _ = t.into_data(); // force evaluation
 }
 
-/// Single-step evaluation for one [`TensorOp`].
-/// Binary ops fold the tensor with a clone of itself (only one value in scope).
+/// Single-step evaluation for one TensorOp
 fn step_tensor(t: Tensor<PlainB, 2>, op: &TensorOp) -> Tensor<PlainB, 2> {
     match op {
         TensorOp::Add => t.clone() + t.clone(),
@@ -209,16 +196,10 @@ fn step_tensor(t: Tensor<PlainB, 2>, op: &TensorOp) -> Tensor<PlainB, 2> {
     }
 }
 
-// ─── autograd interpreter ─────────────────────────────────────────────────────
+// Autograd interpreter 
+// ─────────────────────────────────────────────────────
 
-/// Execute an [`AutogradProgram`] against the Autodiff<NdArray> backend.
-///
-/// Leaves are discovered dynamically: `x_0` always seeds the accumulator, and
-/// each binary op's [`TensorRef::Leaf`] byte drives the stack algorithm
-/// ([`TensorRef::dispatch_leaf_idx`]), introducing new leaves or reusing
-/// existing ones up to `config.max_leaves`.
-///
-/// `config.mode` controls crash behaviour (re-panic vs. continuous logging).
+/// run AutogradProgram against Autodiff<NdArray> backend
 pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) {
     let display = prog.ssa(config.max_leaves);
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -237,8 +218,7 @@ fn run_autograd_program_inner(prog: &AutogradProgram, config: &FuzzConfig) {
     let cols = (prog.cols as usize).clamp(1, 16);
     let device = NdArrayDevice::default();
 
-    // x_0 is unconditionally the accumulator seed.  It is always reachable in
-    // the compute graph (loss = t.sum() flows back through every op to x_0).
+    // x_0 accumulator seed
     let leaf_0 = make_leaf(
         prog.leaves.get(0).map(Vec::as_slice).unwrap_or(&[]),
         rows, cols, &device,
@@ -246,18 +226,15 @@ fn run_autograd_program_inner(prog: &AutogradProgram, config: &FuzzConfig) {
     let mut leaf_stack: Vec<Tensor<DiffB, 2>> = vec![leaf_0.clone()];
     let mut t: Tensor<DiffB, 2> = leaf_0;
 
-    // Run the op sequence.  Binary ops may grow leaf_stack via the stack
-    // dispatch algorithm, building a real DAG (not just a chain).
+    // Run op sequence
+    // bin ops grow leaf_stack to build DAG
     for op in &prog.ops {
         t = step_diff(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, &device);
     }
 
-    let loss = t.sum();
-    let grads = loss.backward();
+    let grads = t.backward();
 
-    // Every leaf in leaf_stack was introduced because it appeared in an op
-    // that contributed to the computation graph, so a missing gradient here
-    // is a genuine Burn bug, not a scaffolding artifact.
+    // check if there is missing gradient for any leaf actually used
     for (i, leaf) in leaf_stack.iter().enumerate() {
         if leaf.grad(&grads).is_none() {
             panic!("grad of leaf x_{i} missing after backward()");
@@ -265,7 +242,6 @@ fn run_autograd_program_inner(prog: &AutogradProgram, config: &FuzzConfig) {
     }
 }
 
-/// Build one `requires_grad` leaf tensor from raw seed bytes.
 fn make_leaf(raw: &[u8], rows: usize, cols: usize, device: &NdArrayDevice) -> Tensor<DiffB, 2> {
     Tensor::<DiffB, 1>::from_floats(
         bytes_to_floats(raw, rows * cols).as_slice(),
@@ -277,9 +253,9 @@ fn make_leaf(raw: &[u8], rows: usize, cols: usize, device: &NdArrayDevice) -> Te
 
 /// Resolve a [`TensorRef`] using the leaf-stack dispatch algorithm.
 ///
-/// - `TensorRef::Current` → clone the accumulator `t`.
+/// - `TensorRef::Current` → clone the accumulator t
 /// - `TensorRef::Leaf(raw)` → reuse or introduce a leaf via
-///   [`TensorRef::dispatch_leaf_idx`], growing `leaf_stack` when a new leaf
+///   [`TensorRef::dispatch_leaf_idx`], growing `leaf_stack` when a new leaf used
 ///   is introduced.
 fn resolve_ref(
     r: &TensorRef,
@@ -435,7 +411,7 @@ fn collect_grads_ndarray(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<Vec
     for op in &prog.ops {
         t = step_diff(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, &device);
     }
-    let grads = t.sum().backward();
+    let grads = t.backward();
     leaf_stack.iter().enumerate().map(|(i, leaf)| {
         leaf.grad(&grads)
             .unwrap_or_else(|| panic!("oracle(ndarray): grad of x_{i} is None"))
@@ -458,7 +434,7 @@ fn collect_grads_libtorch(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<Ve
     for op in &prog.ops {
         t = step_diff_tch(t, op, &mut leaf_stack, &prog.leaves, config.max_leaves, rows, cols, &device);
     }
-    let grads = t.sum().backward();
+    let grads = t.backward();
     leaf_stack.iter().enumerate().map(|(i, leaf)| {
         leaf.grad(&grads)
             .unwrap_or_else(|| panic!("oracle(libtorch): grad of x_{i} is None"))

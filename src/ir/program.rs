@@ -1,8 +1,8 @@
 //! Root AST nodes and runtime configuration for fuzz programs.
 
 use std::fmt;
-use arbitrary::Arbitrary;
 use super::ops::{DiffOp, TensorInstr};
+use super::shape::Shape2;
 
 // ─── harness mode ─────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,6 +22,10 @@ pub struct FuzzConfig {
 
     pub min_dim: usize,
     pub max_dim: usize,
+
+    /// 0–100: probability (%) that `pick_reg` returns the last-written register
+    /// (the "sink") instead of picking uniformly.  Higher = deeper chains.
+    pub sink_bias: u8,
 }
 
 impl Default for FuzzConfig {
@@ -32,6 +36,7 @@ impl Default for FuzzConfig {
             mode: HarnessMode::PanicOnFirstError,
             min_dim: 1,
             max_dim: 16,
+            sink_bias: 60,
         }
     }
 }
@@ -70,12 +75,19 @@ impl FuzzConfig {
             .unwrap_or(16)
             .clamp(min_dim, 4096);
 
+        let sink_bias = std::env::var("BIAS")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(25)
+            .clamp(0, 100);
+
         FuzzConfig {
             max_leaves,
             min_ops,
             mode,
             min_dim,
             max_dim,
+            sink_bias,
         }
     }
 }
@@ -83,12 +95,15 @@ impl FuzzConfig {
 
 /// SSA tensor program.  `r0` is seeded from `values`; every [`TensorInstr`]
 /// appends a new register to the file.
-#[derive(Arbitrary, Debug)]
+#[derive(Debug)]
 pub struct TensorProgram {
     pub rows: u8,
     pub cols: u8,
     pub values: Vec<u8>,
     pub ops: Vec<TensorInstr>,
+    /// Pre-computed shape of every register.  `shapes[0]` is r0, `shapes[i+1]`
+    /// is the output of `ops[i]`.  Populated by the generator.
+    pub shapes: Vec<Shape2>,
 }
 
 impl fmt::Display for TensorProgram {
@@ -96,11 +111,19 @@ impl fmt::Display for TensorProgram {
         let rows = (self.rows as usize).clamp(1, 16);
         let cols = (self.cols as usize).clamp(1, 16);
         writeln!(f, "=== TensorProgram [{}×{}] ===", rows, cols)?;
-        writeln!(f, "r0 = input({}×{}, {} seed bytes)", rows, cols, self.values.len())?;
+
+        let sh = |reg: usize| -> String {
+            self.shapes
+                .get(reg)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "[?×?]".into())
+        };
+
+        writeln!(f, "r0 {} = input({}×{}, {} seed bytes)", sh(0), rows, cols, self.values.len())?;
         let mut num_regs: usize = 1;
         for instr in &self.ops {
             let out = format!("r{}", num_regs);
-            writeln!(f, "{}", instr.ssa_line(&out, num_regs))?;
+            writeln!(f, "{} {} = {}", out, sh(num_regs), instr.ssa_line("_").trim_start_matches("_ = "))?;
             num_regs += 1;
         }
         write!(f, "result = r{}.into_data()", num_regs - 1)
@@ -124,89 +147,51 @@ pub struct AutogradProgram {
     /// Pool of seed byte-vectors for leaf tensors.
     pub leaf_seeds: Vec<Vec<u8>>,
     pub ops: Vec<DiffOp>,
+    /// Pre-computed shape of every register.  `shapes[0]` is r0, `shapes[i+1]`
+    /// is the output of `ops[i]`.  Populated by the generator; the interpreter
+    /// trusts these instead of recomputing.
+    pub shapes: Vec<Shape2>,
 }
 
 impl AutogradProgram {
-    /// Pretty-print the program in SSA form, simulating register resolution
-    /// and annotating every line with the output shape.
-    pub fn ssa(&self, max_leaves: usize) -> String {
+    /// Pretty-print the program in SSA form using pre-computed shapes.
+    pub fn ssa(&self) -> String {
         use std::fmt::Write;
-        use super::shape::Shape2;
-        use super::interpreter::shape::after_diff_op;
 
         let rows = (self.rows as usize).clamp(1, 16);
         let cols = (self.cols as usize).clamp(1, 16);
         let mut s = String::new();
+        let _ = writeln!(s, "=== AutogradProgram [{}×{}] ===", rows, cols);
 
-        let _ = writeln!(
-            s,
-            "=== AutogradProgram [{}×{}] (max_leaves={}) ===",
-            rows, cols, max_leaves
-        );
+        let sh = |reg: usize| -> String {
+            self.shapes.get(reg).map(|s| s.to_string()).unwrap_or_else(|| "[?×?]".into())
+        };
 
-        // r0 = seed leaf (always present)
-        let seed0_len = self.leaf_seeds.first().map(|v| v.len()).unwrap_or(0);
-        let r0_shape = Shape2(rows, cols);
-        let _ = writeln!(
-            s,
-            "r0 {r0_shape} = leaf({}×{}, {} seed bytes)  [requires_grad, seed]",
-            rows, cols, seed0_len
-        );
+        let _ = writeln!(s, "r0 {} = leaf({}×{})  [seed]", sh(0), rows, cols);
 
         let mut num_regs: usize = 1;
-        let mut shapes: Vec<Shape2> = vec![r0_shape];
-        let mut leaf_count: usize = 1;
-        let mut leaf_reg_indices: Vec<usize> = vec![0];
+        let mut leaf_regs: Vec<usize> = vec![0];
 
         for op in &self.ops {
-            let out = format!("r{}", num_regs);
-            let out_shape = match op {
-                DiffOp::Leaf { seed, rows: lr, cols: lc } => {
-                    if leaf_count < max_leaves {
-                        let pool_idx = if self.leaf_seeds.is_empty() {
-                            0
-                        } else {
-                            *seed as usize % self.leaf_seeds.len()
-                        };
-                        let seed_len =
-                            self.leaf_seeds.get(pool_idx).map(|v| v.len()).unwrap_or(0);
-                        let leaf_rows = (*lr as usize).clamp(1, 16);
-                        let leaf_cols = (*lc as usize).clamp(1, 16);
-                        let sh = Shape2(leaf_rows, leaf_cols);
-                        let _ = writeln!(
-                            s,
-                            "{out} {sh} = leaf({leaf_rows}×{leaf_cols}, {seed_len} seed bytes)  \
-                             [requires_grad, leaf #{leaf_count}]",
-                        );
-                        leaf_reg_indices.push(num_regs);
-                        leaf_count += 1;
-                        sh
-                    } else {
-                        let src = (*seed as usize) % num_regs;
-                        let sh = shapes[src];
-                        let _ = writeln!(
-                            s,
-                            "{out} {sh} = r{src}  # leaf cap reached, alias"
-                        );
-                        sh
-                    }
+            let _ = write!(s, "r{} {} = ", num_regs, sh(num_regs));
+            match op {
+                DiffOp::Leaf { rows: lr, cols: lc, .. } => {
+                    let _ = writeln!(s, "leaf({}×{})  [leaf #{}]",
+                        (*lr as usize).clamp(1, 16), (*lc as usize).clamp(1, 16), leaf_regs.len());
+                    leaf_regs.push(num_regs);
                 }
-                _ => {
-                    let sh = after_diff_op(&shapes, op)
-                        .expect("non-Leaf op shape");
-                    let _ = writeln!(s, "{out} {sh} = {}", op.ssa_line("_", num_regs).trim_start_matches("_ = "));
-                    sh
+                DiffOp::Instr(instr) => {
+                    let line = instr.ssa_line("_");
+                    let _ = writeln!(s, "{}", line.trim_start_matches("_ = "));
                 }
-            };
-            shapes.push(out_shape);
+            }
             num_regs += 1;
         }
 
         let last = num_regs - 1;
         let _ = writeln!(s, "grads = backward(r{last})");
-        for &ri in &leaf_reg_indices {
-            let sh = shapes[ri];
-            let _ = writeln!(s, "grad r{ri} {sh} = r{ri}.grad(grads)  # None → zeros if unreachable");
+        for &ri in &leaf_regs {
+            let _ = writeln!(s, "grad r{ri} {}", sh(ri));
         }
         s
     }
@@ -214,6 +199,6 @@ impl AutogradProgram {
 
 impl fmt::Display for AutogradProgram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.ssa(4))
+        write!(f, "{}", self.ssa())
     }
 }

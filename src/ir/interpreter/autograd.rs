@@ -10,9 +10,8 @@ use burn::backend::LibTorch;
 #[cfg(feature = "oracle-tch")]
 use burn::backend::libtorch::LibTorchDevice;
 
-use super::shape::Shape2;
-use super::shape::after_diff_op;
-use super::{bytes_to_floats, catch_as_result, eval_tensor_instr};
+use crate::ir::shape::Shape2;
+use super::{bytes_to_floats, catch_as_result, eval_tensor_instr_direct};
 use crate::ir::ops::DiffOp;
 use crate::ir::program::{AutogradProgram, FuzzConfig};
 
@@ -30,45 +29,35 @@ fn make_leaf<AB: AutodiffBackend>(raw: &[u8], rows: usize, cols: usize, device: 
     .require_grad()
 }
 
-/// Evaluate one non-Leaf [`DiffOp`] against the register file.
-/// Returns `None` for `Leaf` (handled by the main loop).
-fn eval_diff_op<AB: AutodiffBackend>(
-    regs: &[Tensor<AB, 2>],
-    shapes: &[Shape2],
-    op: &DiffOp,
-) -> Option<Tensor<AB, 2>> {
-    match op {
-        DiffOp::Leaf { .. } => None,
-        DiffOp::Instr(instr) => Some(eval_tensor_instr(regs, shapes, instr)),
-    }
-}
-
 /// Run `prog` on any autodiff backend, returning gradient data for every leaf
 /// in introduction order.
+///
+/// The generator guarantees all `Reg` operands are already shape-legal, so we
+/// use `eval_tensor_instr_direct` (no resolve lookups) and read leaf shapes
+/// directly from `prog.shapes`.
 fn collect_grads<AB: AutodiffBackend>(
     prog: &AutogradProgram,
     config: &FuzzConfig,
     device: &AB::Device,
 ) -> Vec<Vec<f32>> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
+    let s0 = prog.shapes.first().copied().unwrap_or(Shape2(1, 1));
 
     // r0 = seed leaf (always present)
     let leaf_0 = make_leaf::<AB>(
         prog.leaf_seeds.first().map(Vec::as_slice).unwrap_or(&[]),
-        rows,
-        cols,
+        s0.rows(),
+        s0.cols(),
         device,
     );
     let mut regs: Vec<Tensor<AB, 2>> = vec![leaf_0];
-    let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
     let mut leaf_indices: Vec<usize> = vec![0];
-    let mut leaf_shapes: Vec<(usize, usize)> = vec![(rows, cols)];
     let mut leaf_count: usize = 1;
 
-    for op in &prog.ops {
-        let (val, out_shape) = match op {
-            DiffOp::Leaf { seed, rows: lr, cols: lc } => {
+    for (i, op) in prog.ops.iter().enumerate() {
+        let val = match op {
+            DiffOp::Leaf { seed, .. } => {
+                // Shape from the pre-computed arena (reg index = i + 1).
+                let s = prog.shapes.get(i + 1).copied().unwrap_or(Shape2(1, 1));
                 if leaf_count < config.max_leaves {
                     let pool_idx = if prog.leaf_seeds.is_empty() {
                         0
@@ -80,28 +69,18 @@ fn collect_grads<AB: AutodiffBackend>(
                         .get(pool_idx)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let leaf_rows = (*lr as usize).clamp(1, 16);
-                    let leaf_cols = (*lc as usize).clamp(1, 16);
-                    let leaf = make_leaf::<AB>(raw, leaf_rows, leaf_cols, device);
+                    let leaf = make_leaf::<AB>(raw, s.rows(), s.cols(), device);
                     leaf_indices.push(regs.len());
-                    leaf_shapes.push((leaf_rows, leaf_cols));
                     leaf_count += 1;
-                    (leaf, Shape2(leaf_rows, leaf_cols))
+                    leaf
                 } else {
                     let alias_idx = (*seed as usize) % regs.len();
-                    (regs[alias_idx].clone(), shapes[alias_idx])
+                    regs[alias_idx].clone()
                 }
             }
-            _ => {
-                let out_shape = after_diff_op(&shapes, op)
-                    .expect("non-Leaf op returned None shape");
-                let val = eval_diff_op(&regs, &shapes, op)
-                    .expect("non-Leaf op returned None");
-                (val, out_shape)
-            }
+            DiffOp::Instr(instr) => eval_tensor_instr_direct(&regs, instr),
         };
         regs.push(val);
-        shapes.push(out_shape);
     }
 
     // backward from the last register
@@ -110,14 +89,14 @@ fn collect_grads<AB: AutodiffBackend>(
 
     leaf_indices
         .iter()
-        .zip(leaf_shapes.iter())
-        .map(|(&ri, &(lr, lc))| {
+        .map(|&ri| {
+            let s = prog.shapes.get(ri).copied().unwrap_or(Shape2(1, 1));
             match regs[ri].grad(&grads) {
                 Some(g) => g
                     .into_data()
                     .to_vec::<f32>()
                     .unwrap_or_else(|e| panic!("into_data for r{ri} grad failed: {e}")),
-                None => vec![0.0_f32; lr * lc],
+                None => vec![0.0_f32; s.rows() * s.cols()],
             }
         })
         .collect()

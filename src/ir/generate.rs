@@ -1,26 +1,39 @@
-//! Shape-aware state-machine program generator for [`AutogradProgram`].
+//! Shape-aware state-machine program generator.
 //!
 //! Instead of flat `#[derive(Arbitrary)]`, the generator maintains an arena of
 //! live register shapes and at each step either:
 //!
-//!  1. **New leaf** — introduces a new `requires_grad` tensor.  The leaf shape
-//!     can be fully random (starting a new branch) or can *inherit* one
-//!     dimension from an existing register and randomise the other (growing an
-//!     existing branch, creating natural compatibility for binary ops / matmul /
-//!     concat).
+//!  1. **New leaf** (autograd only) — introduces a new `requires_grad` tensor.
+//!     The leaf shape can be fully random or can *inherit* one dimension from
+//!     an existing register.
 //!
 //!  2. **Operation** — examines the arena and picks a mathematically legal op.
-//!     Unary / shape-changing ops (transpose, sum_dim, repeat, …) are always
-//!     legal.  Binary ops (add/sub/mul, matmul, concat) search for a compatible
-//!     pair; if none exists they fall back to a guaranteed-legal unary.
+//!     Unary / shape-changing ops are always legal.  Binary ops search for a
+//!     compatible pair; if none exists they fall back to a guaranteed-legal unary.
 //!
-//! This dramatically reduces shape-mismatch dead-ends and lets the fuzzer
-//! explore shape-changing operations without constant passthrough fallbacks.
+//! Both [`AutogradProgram`] and [`TensorProgram`] share the same `ProgramBuilder`
+//! and op-generation logic.
+
+use std::sync::OnceLock;
 
 use arbitrary::{Arbitrary, Unstructured, Error as ArbError};
-use super::ops::{DiffOp, Reg, TensorInstr};
-use super::program::AutogradProgram;
+use super::ops::{BinaryKind, DiffOp, OpCategory, Reg, TensorInstr, UnaryKind};
+use super::program::{AutogradProgram, TensorProgram};
 use super::shape::Shape2;
+
+/// Probability (0–100) that `pick_reg` / `pick_candidate` return the
+/// most-recently-written register (the "sink") instead of a uniform draw.
+/// Read once from `FUZZ_SINK_BIAS`; defaults to 60.
+fn sink_bias() -> u8 {
+    static VAL: OnceLock<u8> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("BIAS")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(60)
+            .clamp(0, 100)
+    })
+}
 
 /// Maximum distinct leaf tensors the builder will introduce (including r0).
 const MAX_BUILDER_LEAVES: usize = 4;
@@ -71,10 +84,9 @@ impl ProgramBuilder {
     /// One step of the state machine.
     fn step(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let can_leaf = self.leaf_count < MAX_BUILDER_LEAVES;
-        let roll: u8 = u.int_in_range(0..=99)?;
+        let want_leaf: bool = can_leaf && u.arbitrary()?;
 
-        // ~30 % chance of a new leaf when under the cap
-        if can_leaf && roll < 30 {
+        if want_leaf {
             self.gen_leaf(u)
         } else {
             self.gen_operation(u)
@@ -135,22 +147,32 @@ impl ProgramBuilder {
     fn gen_operation(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         debug_assert!(!self.arena.is_empty());
 
-        let cat: u8 = u.int_in_range(0..=10)?;
-        match cat {
-            0..=2 => self.gen_unary(u),       // ~27 % unary element-wise
-            3..=4 => self.gen_binary(u),       // ~18 % add / sub / mul
-            5     => self.gen_matmul(u),       // ~ 9 %
-            6     => self.gen_transpose(u),    // ~ 9 %
-            7     => self.gen_dim_reduce(u),   // ~ 9 % sum_dim / mean_dim
-            8     => self.gen_full_reduce(u),  // ~ 9 % sum_all / mean_all
-            9     => self.gen_concat(u),       // ~ 9 %
-            _     => self.gen_repeat(u),       // ~ 9 %
+        match u.arbitrary::<OpCategory>()? {
+            OpCategory::Unary      => self.gen_unary(u),
+            OpCategory::Binary     => self.gen_binary(u),
+            OpCategory::Matmul     => self.gen_matmul(u),
+            OpCategory::Transpose  => self.gen_transpose(u),
+            OpCategory::DimReduce  => self.gen_dim_reduce(u),
+            OpCategory::FullReduce => self.gen_full_reduce(u),
+            OpCategory::Concat     => self.gen_concat(u),
+            OpCategory::Repeat     => self.gen_repeat(u),
+            OpCategory::Powf       => self.gen_powf(u),
+            OpCategory::Slice      => self.gen_slice(u),
         }
     }
 
-    /// Pick a random register index and return `(index, Reg)`.
+    /// Pick a register index biased toward the most recent (deepest) register.
+    ///
+    /// With probability `FUZZ_SINK_BIAS`% returns the last-written register
+    /// (the current sink of the dataflow graph).  Otherwise picks uniformly.
     fn pick_reg(&self, u: &mut Unstructured) -> Result<(usize, Reg), ArbError> {
-        let idx: usize = u.int_in_range(0..=self.arena.len() - 1)?;
+        let last = self.arena.len() - 1;
+        let roll: u8 = u.int_in_range(0..=99)?;
+        let idx = if roll < sink_bias() {
+            last
+        } else {
+            u.int_in_range(0..=last)?
+        };
         Ok((idx, Reg(idx as u8)))
     }
 
@@ -160,24 +182,38 @@ impl ProgramBuilder {
         self.arena.push(out);
     }
 
+    /// From a non-empty candidate list, pick an index biased toward the last
+    /// (highest-index) candidate — same sink-bias coin flip as [`pick_reg`].
+    fn pick_candidate(&self, cands: &[usize], u: &mut Unstructured) -> Result<usize, ArbError> {
+        let last = cands.len() - 1;
+        let roll: u8 = u.int_in_range(0..=99)?;
+        let ci = if roll < sink_bias() {
+            last
+        } else {
+            u.int_in_range(0..=last)?
+        };
+        Ok(cands[ci])
+    }
+
     // ── individual op generators ────────────────────────────────────────────
 
     fn gen_unary(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let (idx, reg) = self.pick_reg(u)?;
-        let dim = self.arena[idx];
-        let v: u8 = u.int_in_range(0..=8)?;
-        let instr = match v {
-            0 => TensorInstr::Neg(reg),
-            1 => TensorInstr::Abs(reg),
-            2 => TensorInstr::Exp(reg),
-            3 => TensorInstr::Log(reg),
-            4 => TensorInstr::Sqrt(reg),
-            5 => TensorInstr::Relu(reg),
-            6 => TensorInstr::Sigmoid(reg),
-            7 => TensorInstr::Tanh(reg),
-            _ => TensorInstr::Clamp(reg),
+        let shape = self.arena[idx];
+        let instr = match u.arbitrary::<UnaryKind>()? {
+            UnaryKind::Neg     => TensorInstr::Neg(reg),
+            UnaryKind::Abs     => TensorInstr::Abs(reg),
+            UnaryKind::Exp     => TensorInstr::Exp(reg),
+            UnaryKind::Log     => TensorInstr::Log(reg),
+            UnaryKind::Sqrt    => TensorInstr::Sqrt(reg),
+            UnaryKind::Cos     => TensorInstr::Cos(reg),
+            UnaryKind::Sin     => TensorInstr::Sin(reg),
+            UnaryKind::Relu    => TensorInstr::Relu(reg),
+            UnaryKind::Sigmoid => TensorInstr::Sigmoid(reg),
+            UnaryKind::Tanh    => TensorInstr::Tanh(reg),
+            UnaryKind::Clamp   => TensorInstr::Clamp(reg),
         };
-        self.push_instr(instr, dim);
+        self.push_instr(instr, shape);
         Ok(())
     }
 
@@ -193,8 +229,7 @@ impl ProgramBuilder {
 
     fn gen_full_reduce(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let (_idx, reg) = self.pick_reg(u)?;
-        let is_mean: bool = u.arbitrary()?;
-        let instr = if is_mean {
+        let instr = if u.arbitrary()? {
             TensorInstr::MeanAll(reg)
         } else {
             TensorInstr::SumAll(reg)
@@ -206,17 +241,16 @@ impl ProgramBuilder {
     fn gen_dim_reduce(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let (idx, reg) = self.pick_reg(u)?;
         let s = self.arena[idx];
-        let dim: u8 = u.int_in_range(0..=1)?;
-        let is_mean: bool = u.arbitrary()?;
+        let dim: u8 = if u.arbitrary()? { 1 } else { 0 };
         let out = if dim == 0 {
             Shape2(1, s.cols())
         } else {
             Shape2(s.rows(), 1)
         };
-        let instr = if is_mean {
-            TensorInstr::MeanDim(reg, dim)
-        } else {
-            TensorInstr::SumDim(reg, dim)
+        let instr = match u.int_in_range(0..=2u8)? {
+            0 => TensorInstr::SumDim(reg, dim),
+            1 => TensorInstr::MeanDim(reg, dim),
+            _ => TensorInstr::ArgMax(reg, dim),
         };
         self.push_instr(instr, out);
         Ok(())
@@ -231,15 +265,16 @@ impl ProgramBuilder {
             .filter(|&i| sa.broadcast_compatible(self.arena[i]))
             .collect();
 
-        let bi = cands[u.int_in_range(0..=cands.len() - 1)?];
+        let bi = self.pick_candidate(&cands, u)?;
         let sb = self.arena[bi];
         let out = sa.broadcast_result(sb);
+        let b_reg = Reg(bi as u8);
 
-        let v: u8 = u.int_in_range(0..=2)?;
-        let instr = match v {
-            0 => TensorInstr::Add(a_reg, Reg(bi as u8)),
-            1 => TensorInstr::Sub(a_reg, Reg(bi as u8)),
-            _ => TensorInstr::Mul(a_reg, Reg(bi as u8)),
+        let instr = match u.arbitrary::<BinaryKind>()? {
+            BinaryKind::Add => TensorInstr::Add(a_reg, b_reg),
+            BinaryKind::Sub => TensorInstr::Sub(a_reg, b_reg),
+            BinaryKind::Mul => TensorInstr::Mul(a_reg, b_reg),
+            BinaryKind::Div => TensorInstr::Div(a_reg, b_reg),
         };
         self.push_instr(instr, out);
         Ok(())
@@ -258,7 +293,7 @@ impl ProgramBuilder {
             return self.gen_unary(u);
         }
 
-        let bi = cands[u.int_in_range(0..=cands.len() - 1)?];
+        let bi = self.pick_candidate(&cands, u)?;
         let sb = self.arena[bi];
         self.push_instr(
             TensorInstr::Matmul(a_reg, Reg(bi as u8)),
@@ -270,7 +305,7 @@ impl ProgramBuilder {
     fn gen_concat(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let (ai, a_reg) = self.pick_reg(u)?;
         let sa = self.arena[ai];
-        let dim: u8 = u.int_in_range(0..=1)?;
+        let dim: u8 = if u.arbitrary()? { 1 } else { 0 };
 
         let cands: Vec<usize> = (0..self.arena.len())
             .filter(|&i| {
@@ -287,7 +322,7 @@ impl ProgramBuilder {
             return self.gen_unary(u);
         }
 
-        let bi = cands[u.int_in_range(0..=cands.len() - 1)?];
+        let bi = self.pick_candidate(&cands, u)?;
         let sb = self.arena[bi];
         let out = if dim == 0 {
             Shape2(sa.rows() + sb.rows(), sa.cols())
@@ -301,7 +336,7 @@ impl ProgramBuilder {
     fn gen_repeat(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let (idx, reg) = self.pick_reg(u)?;
         let s = self.arena[idx];
-        let dim: u8 = u.int_in_range(0..=1)?;
+        let dim: u8 = if u.arbitrary()? { 1 } else { 0 };
         let cur = if dim == 0 { s.rows() } else { s.cols() };
         let max_times = (MAX_DIM / cur).min(4).max(1);
         let times: u8 = u.int_in_range(1..=max_times as u8)?;
@@ -313,15 +348,59 @@ impl ProgramBuilder {
         self.push_instr(TensorInstr::Repeat(reg, dim, times), out);
         Ok(())
     }
+    fn gen_powf(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
+        let (idx, reg) = self.pick_reg(u)?;
+        let shape = self.arena[idx];
+        let c: u8 = u.int_in_range(0..=4)?;
+        self.push_instr(TensorInstr::Powf(reg, c), shape);
+        Ok(())
+    }
 
+    fn gen_slice(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
+        let (idx, reg) = self.pick_reg(u)?;
+        let s = self.arena[idx];
+        let dim: u8 = if u.arbitrary()? { 1 } else { 0 };
+        let size = if dim == 0 { s.rows() } else { s.cols() };
+        if size <= 1 {
+            return self.gen_unary(u);
+        }
+        let take: u8 = u.int_in_range(1..=size as u8 - 1)?;
+        let out = if dim == 0 {
+            Shape2(take as usize, s.cols())
+        } else {
+            Shape2(s.rows(), take as usize)
+        };
+        self.push_instr(TensorInstr::Slice(reg, dim, take), out);
+        Ok(())
+    }
     // ── finalise ────────────────────────────────────────────────────────────
 
-    fn build(self) -> AutogradProgram {
+    fn build_autograd(self) -> AutogradProgram {
         AutogradProgram {
             rows: self.r0_rows,
             cols: self.r0_cols,
             leaf_seeds: self.leaf_seeds,
             ops: self.ops,
+            shapes: self.arena,
+        }
+    }
+
+    fn build_tensor(self) -> TensorProgram {
+        let instrs: Vec<TensorInstr> = self.ops.into_iter().filter_map(|op| {
+            match op {
+                DiffOp::Instr(i) => Some(i),
+                _ => None,
+            }
+        }).collect();
+        // shapes[0] = r0, shapes[1..] from ops.  Since we filtered leaves
+        // that never appear in a TensorProgram build, the arena is already
+        // just r0 + one shape per TensorInstr.
+        TensorProgram {
+            rows: self.r0_rows,
+            cols: self.r0_cols,
+            values: self.leaf_seeds.into_iter().next().unwrap_or_default(),
+            ops: instrs,
+            shapes: self.arena,
         }
     }
 }
@@ -350,6 +429,34 @@ impl<'a> Arbitrary<'a> for AutogradProgram {
             b.step(u)?;
         }
 
-        Ok(b.build())
+        Ok(b.build_autograd())
+    }
+}
+
+// ─── Arbitrary impl for TensorProgram ───────────────────────────────────────
+
+impl<'a> Arbitrary<'a> for TensorProgram {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self, ArbError> {
+        let mut b = ProgramBuilder::new();
+
+        // r0: single input tensor
+        let rows: u8 = u.int_in_range(1..=16)?;
+        let cols: u8 = u.int_in_range(1..=16)?;
+        let seed_len: usize = u.int_in_range(1..=16)?;
+        let seed: Vec<u8> = (0..seed_len)
+            .map(|_| u.arbitrary())
+            .collect::<Result<_, _>>()?;
+        b.add_seed_leaf(rows, cols, seed);
+
+        // Only operations, no extra leaves
+        let num_steps: usize = u.int_in_range(1..=MAX_STEPS)?;
+        for _ in 0..num_steps {
+            if u.is_empty() {
+                break;
+            }
+            b.gen_operation(u)?;
+        }
+
+        Ok(b.build_tensor())
     }
 }

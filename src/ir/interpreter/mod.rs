@@ -4,7 +4,6 @@
 //! decides what to do: in `PanicOnFirstError` mode it panics (so libFuzzer
 //! saves the crash artifact), in `Continuous` it logs to stderr and moves on.
 
-pub(crate) mod shape;
 mod tensor_program;
 mod autograd;
 
@@ -15,8 +14,7 @@ use burn::backend::NdArray;
 use burn::tensor::{activation, Tensor};
 use burn::tensor::backend::Backend;
 
-use super::ops::TensorInstr;
-use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
+use super::ops::{Reg, TensorInstr};
 
 type PlainB = NdArray;
 
@@ -69,69 +67,55 @@ fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
 
 // ─── shared instruction evaluator ────────────────────────────────────────────
 
-/// Evaluate one [`TensorInstr`] against the register file, using `shapes`
-/// to ensure binary operands are shape-compatible.
-fn eval_tensor_instr<B: Backend>(
+/// Evaluate one [`TensorInstr`] against the register file.
+/// The generator guarantees every `Reg` is a valid index.
+pub(super) fn eval_tensor_instr_direct<B: Backend>(
     regs: &[Tensor<B, 2>],
-    shapes: &[Shape2],
     instr: &TensorInstr,
 ) -> Tensor<B, 2> {
-    let n = regs.len();
+    let r = |reg: &Reg| -> Tensor<B, 2> { regs[usize::from(*reg)].clone() };
     match instr {
-        TensorInstr::Add(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() + regs[bi].clone()
-        }
-        TensorInstr::Sub(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() - regs[bi].clone()
-        }
-        TensorInstr::Mul(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() * regs[bi].clone()
-        }
-        TensorInstr::Matmul(a, b) => {
-            let ai = a.resolve(n);
-            match resolve_matmul_compatible(shapes, ai, b) {
-                Some(bi) => regs[ai].clone().matmul(regs[bi].clone()),
-                None => regs[ai].clone(),
-            }
-        }
-        TensorInstr::Neg(r)       => regs[r.resolve(n)].clone().neg(),
-        TensorInstr::Abs(r)       => regs[r.resolve(n)].clone().abs(),
-        TensorInstr::Exp(r)       => regs[r.resolve(n)].clone().exp(),
-        TensorInstr::Log(r)       => regs[r.resolve(n)].clone().log(),
-        TensorInstr::Sqrt(r)      => regs[r.resolve(n)].clone().sqrt(),
-        TensorInstr::Relu(r)      => activation::relu(regs[r.resolve(n)].clone()),
-        TensorInstr::Sigmoid(r)   => activation::sigmoid(regs[r.resolve(n)].clone()),
-        TensorInstr::Tanh(r)      => activation::tanh(regs[r.resolve(n)].clone()),
-        TensorInstr::SumAll(r)    => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
-        TensorInstr::MeanAll(r)   => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
-        TensorInstr::SumDim(r, d)  => {
-            let dim = *d as usize % 2;
-            regs[r.resolve(n)].clone().sum_dim(dim)
-        }
-        TensorInstr::MeanDim(r, d) => {
-            let dim = *d as usize % 2;
-            regs[r.resolve(n)].clone().mean_dim(dim)
-        }
-        TensorInstr::Transpose(r) => regs[r.resolve(n)].clone().transpose(),
+        TensorInstr::Add(a, b)    => r(a) + r(b),
+        TensorInstr::Sub(a, b)    => r(a) - r(b),
+        TensorInstr::Mul(a, b)    => r(a) * r(b),
+        TensorInstr::Div(a, b)    => r(a) / r(b),
+        TensorInstr::Matmul(a, b) => r(a).matmul(r(b)),
+        TensorInstr::Neg(x)       => r(x).neg(),
+        TensorInstr::Abs(x)       => r(x).abs(),
+        TensorInstr::Exp(x)       => r(x).exp(),
+        TensorInstr::Log(x)       => r(x).log(),
+        TensorInstr::Sqrt(x)      => r(x).sqrt(),
+        TensorInstr::Cos(x)       => r(x).cos(),
+        TensorInstr::Sin(x)       => r(x).sin(),
+        TensorInstr::Relu(x)      => activation::relu(r(x)),
+        TensorInstr::Sigmoid(x)   => activation::sigmoid(r(x)),
+        TensorInstr::Tanh(x)      => activation::tanh(r(x)),
+        TensorInstr::SumAll(x)    => r(x).sum().unsqueeze::<2>(),
+        TensorInstr::MeanAll(x)   => r(x).mean().unsqueeze::<2>(),
+        TensorInstr::SumDim(x, d)  => { let dim = *d as usize % 2; r(x).sum_dim(dim) }
+        TensorInstr::MeanDim(x, d) => { let dim = *d as usize % 2; r(x).mean_dim(dim) }
+        TensorInstr::ArgMax(x, d)  => { let dim = *d as usize % 2; r(x).argmax(dim).float() }
+        TensorInstr::Transpose(x) => r(x).transpose(),
         TensorInstr::Concat(a, b, d) => {
-            let ai = a.resolve(n);
             let dim = *d as usize % 2;
-            match resolve_concat_compatible(shapes, ai, b, dim) {
-                Some(bi) => Tensor::cat(vec![regs[ai].clone(), regs[bi].clone()], dim),
-                None => regs[ai].clone(),
-            }
+            Tensor::cat(vec![r(a), r(b)], dim)
         }
-        TensorInstr::Repeat(r, d, c) => {
+        TensorInstr::Repeat(x, d, c) => {
             let dim = *d as usize % 2;
-            let count = (*c as usize).clamp(1, 4);
-            regs[r.resolve(n)].clone().repeat_dim(dim, count)
+            r(x).repeat_dim(dim, (*c as usize).clamp(1, 4))
         }
-        TensorInstr::Clamp(r)     => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
+        TensorInstr::Slice(x, d, len) => {
+            let t = r(x);
+            let dims = t.dims();
+            let dim = *d as usize % 2;
+            let take = (*len as usize).clamp(1, dims[dim]);
+            if dim == 0 { t.slice([0..take, 0..dims[1]]) }
+            else { t.slice([0..dims[0], 0..take]) }
+        }
+        TensorInstr::Powf(x, c) => {
+            const EXP: [f32; 5] = [0.5, 2.0, 3.0, -1.0, 1.5];
+            r(x).powf_scalar(EXP[(*c as usize) % EXP.len()])
+        }
+        TensorInstr::Clamp(x)     => r(x).clamp(-1e6_f32, 1e6_f32),
     }
 }

@@ -107,15 +107,18 @@ impl ProgramBuilder {
         let mode: u8 = u.int_in_range(0..=3)?;
         let dim = match mode {
             1 if !self.arena.is_empty() => {
-                let src = self.arena[u.int_in_range(0..=self.arena.len() - 1)?];
+                let (idx, _) = self.pick_reg(u)?;
+                let src = self.arena[idx];
                 Shape2(src.rows(), u.int_in_range(1..=16)?)
             }
             2 if !self.arena.is_empty() => {
-                let src = self.arena[u.int_in_range(0..=self.arena.len() - 1)?];
+                let (idx, _) = self.pick_reg(u)?;
+                let src = self.arena[idx];
                 Shape2(u.int_in_range(1..=16)?, src.cols())
             }
             3 if !self.arena.is_empty() => {
-                let src = self.arena[u.int_in_range(0..=self.arena.len() - 1)?];
+                let (idx, _) = self.pick_reg(u)?;
+                let src = self.arena[idx];
                 Shape2(src.cols(), u.int_in_range(1..=16)?)
             }
             _ => Shape2(

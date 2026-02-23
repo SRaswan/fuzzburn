@@ -36,7 +36,7 @@ impl Default for FuzzConfig {
             mode: HarnessMode::PanicOnFirstError,
             min_dim: 1,
             max_dim: 16,
-            sink_bias: 60,
+            sink_bias: 20,
         }
     }
 }
@@ -78,7 +78,7 @@ impl FuzzConfig {
         let sink_bias = std::env::var("BIAS")
             .ok()
             .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(25)
+            .unwrap_or(20)
             .clamp(0, 100);
 
         FuzzConfig {

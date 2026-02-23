@@ -4,7 +4,7 @@
 //! decides what to do: in `PanicOnFirstError` mode it panics (so libFuzzer
 //! saves the crash artifact), in `Continuous` it logs to stderr and moves on.
 
-mod shape;
+pub(crate) mod shape;
 mod tensor_program;
 mod autograd;
 
@@ -16,7 +16,7 @@ use burn::tensor::{activation, Tensor};
 use burn::tensor::backend::Backend;
 
 use super::ops::TensorInstr;
-use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible};
+use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
 
 type PlainB = NdArray;
 
@@ -110,7 +110,28 @@ fn eval_tensor_instr<B: Backend>(
         TensorInstr::Tanh(r)      => activation::tanh(regs[r.resolve(n)].clone()),
         TensorInstr::SumAll(r)    => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
         TensorInstr::MeanAll(r)   => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
+        TensorInstr::SumDim(r, d)  => {
+            let dim = *d as usize % 2;
+            regs[r.resolve(n)].clone().sum_dim(dim)
+        }
+        TensorInstr::MeanDim(r, d) => {
+            let dim = *d as usize % 2;
+            regs[r.resolve(n)].clone().mean_dim(dim)
+        }
         TensorInstr::Transpose(r) => regs[r.resolve(n)].clone().transpose(),
+        TensorInstr::Concat(a, b, d) => {
+            let ai = a.resolve(n);
+            let dim = *d as usize % 2;
+            match resolve_concat_compatible(shapes, ai, b, dim) {
+                Some(bi) => Tensor::cat(vec![regs[ai].clone(), regs[bi].clone()], dim),
+                None => regs[ai].clone(),
+            }
+        }
+        TensorInstr::Repeat(r, d, c) => {
+            let dim = *d as usize % 2;
+            let count = (*c as usize).clamp(1, 4);
+            regs[r.resolve(n)].clone().repeat_dim(dim, count)
+        }
         TensorInstr::Clamp(r)     => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
     }
 }

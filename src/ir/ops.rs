@@ -56,8 +56,13 @@ pub enum TensorInstr {
     // --- reductions ---
     SumAll(Reg),
     MeanAll(Reg),
+    // --- dimensional reductions ---
+    SumDim(Reg, u8),
+    MeanDim(Reg, u8),
     // --- layout ---
     Transpose(Reg),
+    Concat(Reg, Reg, u8),
+    Repeat(Reg, u8, u8),
     // --- matmul ---
     Matmul(Reg, Reg),
     // --- guard ---
@@ -82,7 +87,24 @@ impl TensorInstr {
             TensorInstr::Tanh(r)      => format!("{out} = tanh({})", r.name(num_regs)),
             TensorInstr::SumAll(r)    => format!("{out} = sum({})  # → [1,1]", r.name(num_regs)),
             TensorInstr::MeanAll(r)   => format!("{out} = mean({})  # → [1,1]", r.name(num_regs)),
+            TensorInstr::SumDim(r, d)  => {
+                let dim = *d as usize % 2;
+                format!("{out} = sum({}, dim={dim})", r.name(num_regs))
+            }
+            TensorInstr::MeanDim(r, d) => {
+                let dim = *d as usize % 2;
+                format!("{out} = mean({}, dim={dim})", r.name(num_regs))
+            }
             TensorInstr::Transpose(r) => format!("{out} = {}.T", r.name(num_regs)),
+            TensorInstr::Concat(a, b, d) => {
+                let dim = *d as usize % 2;
+                format!("{out} = cat([{}, {}], dim={dim})", a.name(num_regs), b.name(num_regs))
+            }
+            TensorInstr::Repeat(r, d, c) => {
+                let dim = *d as usize % 2;
+                let count = (*c as usize).clamp(1, 4);
+                format!("{out} = {}.repeat(dim={dim}, ×{count})", r.name(num_regs))
+            }
             TensorInstr::Matmul(a, b) => format!("{out} = {} @ {}", a.name(num_regs), b.name(num_regs)),
             TensorInstr::Clamp(r)     => format!("{out} = clamp({}, -1e6, 1e6)", r.name(num_regs)),
         }

@@ -11,6 +11,7 @@ use burn::backend::LibTorch;
 use burn::backend::libtorch::LibTorchDevice;
 
 use super::shape::Shape2;
+use super::shape::after_tensor_instr;
 use super::{PlainB, bytes_to_floats, catch_as_result, eval_tensor_instr};
 use crate::ir::program::TensorProgram;
 
@@ -34,7 +35,7 @@ fn eval_tensor_program<B: Backend>(prog: &TensorProgram, device: &B::Device) -> 
     let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
 
     for instr in &prog.ops {
-        let out_shape = Shape2::after_tensor_instr(&shapes, instr);
+        let out_shape = after_tensor_instr(&shapes, instr);
         let val = eval_tensor_instr(&regs, &shapes, instr);
         regs.push(val);
         shapes.push(out_shape);

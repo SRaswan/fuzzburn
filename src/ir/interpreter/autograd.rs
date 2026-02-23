@@ -11,6 +11,7 @@ use burn::backend::LibTorch;
 use burn::backend::libtorch::LibTorchDevice;
 
 use super::shape::Shape2;
+use super::shape::after_diff_op;
 use super::{bytes_to_floats, catch_as_result, eval_tensor_instr};
 use crate::ir::ops::DiffOp;
 use crate::ir::program::{AutogradProgram, FuzzConfig};
@@ -92,7 +93,7 @@ fn collect_grads<AB: AutodiffBackend>(
                 }
             }
             _ => {
-                let out_shape = Shape2::after_diff_op(&shapes, op)
+                let out_shape = after_diff_op(&shapes, op)
                     .expect("non-Leaf op returned None shape");
                 let val = eval_diff_op(&regs, &shapes, op)
                     .expect("non-Leaf op returned None");

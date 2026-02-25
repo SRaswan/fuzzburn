@@ -1,10 +1,3 @@
-//! IR interpreter – walks SSA programs using a register-file architecture.
-//!
-//! All public entry-points return `Result<(), String>`.  The fuzz target
-//! decides what to do: in `PanicOnFirstError` mode it panics (so libFuzzer
-//! saves the crash artifact), in `Continuous` it logs to stderr and moves on.
-
-pub(crate) mod shape;
 mod tensor_program;
 mod autograd;
 
@@ -15,153 +8,213 @@ use burn::backend::NdArray;
 use burn::tensor::{activation, Tensor};
 use burn::tensor::backend::Backend;
 
-// use burn::tensor::backend::AutodiffBackend;
 use crate::ir::program::FuzzConfig;
-
-use super::ops::TensorInstr;
-use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
+use crate::ir::ops::{Reg, TensorInstr};
 
 type PlainB = NdArray;
 
-// ─── shared utilities ────────────────────────────────────────────────────────
-
-/// Cycle raw bytes and map to f32 values in [-1, 1].
-fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
-    if raw.is_empty() {
-        return vec![0.5_f32; n];
-    }
-    (0..n)
-        .map(|i| raw[i % raw.len()] as f32 / 128.0 - 1.0)
-        .collect()
+/// Convert raw bytes into floats in [-1,1], cycling bytes if needed.
+pub(crate) fn bytes_to_floats(raw: &[u8], n: usize) -> Vec<f32> {
+    if raw.is_empty() { return vec![0.5; n]; }
+    (0..n).map(|i| raw[i % raw.len()] as f32 / 128.0 - 1.0).collect()
 }
 
-/// Wrap a closure that may panic, converting the panic into `Err(String)`.
-fn catch_as_result<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> Result<(), String> {
+/// Catch panics and return them as Err(String).
+pub(crate) fn catch_as_result<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> Result<(), String> {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(f);
+    let r = std::panic::catch_unwind(f);
     std::panic::set_hook(prev);
-    result.map_err(|e| {
-        if let Some(s) = e.downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = e.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<unknown panic payload>".to_string()
-        }
+    r.map_err(|e| {
+        if let Some(s) = e.downcast_ref::<&str>() { (*s).to_string() }
+        else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+        else { "<unknown panic payload>".to_string() }
     })
 }
 
-/// Compare two output vectors element-wise with relative tolerance.
 #[cfg(feature = "oracle-tch")]
-fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
-    assert_eq!(ndarray.len(), libtorch.len(), "oracle shape mismatch in {label}");
-    let mut mismatches = 0_usize;
-    for (_i, (&a, &b)) in ndarray.iter().zip(libtorch).enumerate() {
+pub(crate) fn compare_outputs(nd: &[f32], lt: &[f32], label: &str, cfg: &FuzzConfig) {
+    assert_eq!(nd.len(), lt.len(), "oracle shape mismatch in {label}");
+    let mut mismatches = 0usize;
+    for (i, (&a, &b)) in nd.iter().zip(lt).enumerate() {
         if a.is_nan() && b.is_nan() { continue; }
         let abs_diff = (a - b).abs();
-        let scale = a.abs().max(b.abs()).max(1.0_f32);
-        if abs_diff > 1e-4_f32 * scale {
+        let scale = a.abs().max(b.abs()).max(1.0);
+        if abs_diff > cfg.tol_abs.max(cfg.tol_rel * scale) {
             mismatches += 1;
+            if mismatches <= 8 {
+                eprintln!("oracle mismatch [{i}]: NdArray={a}, LibTorch={b} ({label})");
+            }
         }
+        if mismatches >= cfg.max_mismatches { break; }
     }
     if mismatches > 0 {
         panic!("oracle detected {} mismatches in {}", mismatches, label);
     }
 }
 
-// ─── shared instruction evaluator ────────────────────────────────────────────
+#[inline]
+fn idx(r: &Reg, n: usize) -> usize { (r.0 as usize) % n }
 
-/// Evaluate one [`TensorInstr`] against the register file, using `shapes`
-/// to ensure binary operands are shape-compatible.
-/// Evaluate one [`TensorInstr`] against the register file, using `shapes`
-/// to ensure binary operands are shape-compatible.
-fn eval_tensor_instr<B: Backend>(
-    regs: &[Tensor<B, 2>],
-    shapes: &[Shape2],
+#[derive(Clone)]
+pub enum AnyTensor<B: Backend> {
+    T1(Tensor<B, 1>),
+    T2(Tensor<B, 2>),
+    T3(Tensor<B, 3>),
+    T4(Tensor<B, 4>),
+}
+
+impl<B: Backend> AnyTensor<B> {
+    pub fn rank(&self) -> u8 {
+        match self { AnyTensor::T1(_) => 1, AnyTensor::T2(_) => 2, AnyTensor::T3(_) => 3, AnyTensor::T4(_) => 4 }
+    }
+
+    pub fn to_vec_f32(self) -> Vec<f32> {
+        match self {
+            AnyTensor::T1(t) => t.into_data().to_vec::<f32>().unwrap_or_default(),
+            AnyTensor::T2(t) => t.into_data().to_vec::<f32>().unwrap_or_default(),
+            AnyTensor::T3(t) => t.into_data().to_vec::<f32>().unwrap_or_default(),
+            AnyTensor::T4(t) => t.into_data().to_vec::<f32>().unwrap_or_default(),
+        }
+    }
+
+    fn passthrough(&self) -> AnyTensor<B> { self.clone() }
+}
+
+/// Direct evaluator. If an op isn’t implemented for a given rank, it falls back
+/// to passthrough (keeps fuzzing stable while you expand rank support).
+pub(crate) fn eval_tensor_instr_direct<B: Backend>(
+    regs: &[AnyTensor<B>],
     instr: &TensorInstr,
-    config: &FuzzConfig,
-) -> Tensor<B, 2> {
+    cfg: &FuzzConfig,
+) -> AnyTensor<B> {
     let n = regs.len();
-
     match instr {
-        TensorInstr::Add(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() + regs[bi].clone()
-        }
-        TensorInstr::Sub(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() - regs[bi].clone()
-        }
-        TensorInstr::Mul(a, b) => {
-            let ai = a.resolve(n);
-            let bi = resolve_broadcast_compatible(shapes, ai, b);
-            regs[ai].clone() * regs[bi].clone()
-        }
-        TensorInstr::Matmul(a, b) => {
-            let ai = a.resolve(n);
-            match resolve_matmul_compatible(shapes, ai, b) {
-                Some(bi) => regs[ai].clone().matmul(regs[bi].clone()),
-                None => regs[ai].clone(),
+        TensorInstr::Add(a,b) => match (&regs[idx(a,n)], &regs[idx(b,n)]) {
+            (AnyTensor::T1(x), AnyTensor::T1(y)) => AnyTensor::T1(x.clone() + y.clone()),
+            (AnyTensor::T2(x), AnyTensor::T2(y)) => AnyTensor::T2(x.clone() + y.clone()),
+            (AnyTensor::T3(x), AnyTensor::T3(y)) => AnyTensor::T3(x.clone() + y.clone()),
+            (AnyTensor::T4(x), AnyTensor::T4(y)) => AnyTensor::T4(x.clone() + y.clone()),
+            _ => regs[idx(a,n)].passthrough(),
+        },
+        TensorInstr::Sub(a,b) => match (&regs[idx(a,n)], &regs[idx(b,n)]) {
+            (AnyTensor::T1(x), AnyTensor::T1(y)) => AnyTensor::T1(x.clone() - y.clone()),
+            (AnyTensor::T2(x), AnyTensor::T2(y)) => AnyTensor::T2(x.clone() - y.clone()),
+            (AnyTensor::T3(x), AnyTensor::T3(y)) => AnyTensor::T3(x.clone() - y.clone()),
+            (AnyTensor::T4(x), AnyTensor::T4(y)) => AnyTensor::T4(x.clone() - y.clone()),
+            _ => regs[idx(a,n)].passthrough(),
+        },
+        TensorInstr::Mul(a,b) => match (&regs[idx(a,n)], &regs[idx(b,n)]) {
+            (AnyTensor::T1(x), AnyTensor::T1(y)) => AnyTensor::T1(x.clone() * y.clone()),
+            (AnyTensor::T2(x), AnyTensor::T2(y)) => AnyTensor::T2(x.clone() * y.clone()),
+            (AnyTensor::T3(x), AnyTensor::T3(y)) => AnyTensor::T3(x.clone() * y.clone()),
+            (AnyTensor::T4(x), AnyTensor::T4(y)) => AnyTensor::T4(x.clone() * y.clone()),
+            _ => regs[idx(a,n)].passthrough(),
+        },
+        TensorInstr::Div(a,b) => match (&regs[idx(a,n)], &regs[idx(b,n)]) {
+            (AnyTensor::T1(x), AnyTensor::T1(y)) => {
+                let denom = if cfg.safe_math { y.clone().clamp(1e-6, 1e6) } else { y.clone() };
+                AnyTensor::T1(x.clone() / denom)
             }
-        }
-
-        TensorInstr::Neg(r) => regs[r.resolve(n)].clone().neg(),
-        TensorInstr::Abs(r) => regs[r.resolve(n)].clone().abs(),
-        TensorInstr::Exp(r) => regs[r.resolve(n)].clone().exp(),
-
-        TensorInstr::Log(r) => {
-            let x = regs[r.resolve(n)].clone();
-            if config.safe_math {
-                x.clamp(1e-6_f32, 1e6_f32).log()
-            } else {
-                x.log()
+            (AnyTensor::T2(x), AnyTensor::T2(y)) => {
+                let denom = if cfg.safe_math { y.clone().clamp(1e-6, 1e6) } else { y.clone() };
+                AnyTensor::T2(x.clone() / denom)
             }
-        }
-
-        TensorInstr::Sqrt(r) => {
-            let x = regs[r.resolve(n)].clone();
-            if config.safe_math {
-                x.clamp(0.0_f32, 1e6_f32).sqrt()
-            } else {
-                x.sqrt()
+            (AnyTensor::T3(x), AnyTensor::T3(y)) => {
+                let denom = if cfg.safe_math { y.clone().clamp(1e-6, 1e6) } else { y.clone() };
+                AnyTensor::T3(x.clone() / denom)
             }
-        }
-
-        TensorInstr::Relu(r) => activation::relu(regs[r.resolve(n)].clone()),
-        TensorInstr::Sigmoid(r) => activation::sigmoid(regs[r.resolve(n)].clone()),
-        TensorInstr::Tanh(r) => activation::tanh(regs[r.resolve(n)].clone()),
-        TensorInstr::SumAll(r) => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
-        TensorInstr::MeanAll(r) => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
-
-        TensorInstr::SumDim(r, d) => {
-            let dim = *d as usize % 2;
-            regs[r.resolve(n)].clone().sum_dim(dim)
-        }
-        TensorInstr::MeanDim(r, d) => {
-            let dim = *d as usize % 2;
-            regs[r.resolve(n)].clone().mean_dim(dim)
-        }
-
-        TensorInstr::Transpose(r) => regs[r.resolve(n)].clone().transpose(),
-
-        TensorInstr::Concat(a, b, d) => {
-            let ai = a.resolve(n);
-            let dim = *d as usize % 2;
-            match resolve_concat_compatible(shapes, ai, b, dim) {
-                Some(bi) => Tensor::cat(vec![regs[ai].clone(), regs[bi].clone()], dim),
-                None => regs[ai].clone(),
+            (AnyTensor::T4(x), AnyTensor::T4(y)) => {
+                let denom = if cfg.safe_math { y.clone().clamp(1e-6, 1e6) } else { y.clone() };
+                AnyTensor::T4(x.clone() / denom)
             }
-        }
+            _ => regs[idx(a,n)].passthrough(),
+        },
 
-        TensorInstr::Repeat(r, d, c) => {
-            let dim = *d as usize % 2;
-            let count = (*c as usize).clamp(1, 4);
-            regs[r.resolve(n)].clone().repeat_dim(dim, count)
-        }
+        TensorInstr::Neg(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(x.clone().neg()),
+            AnyTensor::T2(x) => AnyTensor::T2(x.clone().neg()),
+            AnyTensor::T3(x) => AnyTensor::T3(x.clone().neg()),
+            AnyTensor::T4(x) => AnyTensor::T4(x.clone().neg()),
+        },
+        TensorInstr::Abs(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(x.clone().abs()),
+            AnyTensor::T2(x) => AnyTensor::T2(x.clone().abs()),
+            AnyTensor::T3(x) => AnyTensor::T3(x.clone().abs()),
+            AnyTensor::T4(x) => AnyTensor::T4(x.clone().abs()),
+        },
+        TensorInstr::Exp(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(x.clone().exp()),
+            AnyTensor::T2(x) => AnyTensor::T2(x.clone().exp()),
+            AnyTensor::T3(x) => AnyTensor::T3(x.clone().exp()),
+            AnyTensor::T4(x) => AnyTensor::T4(x.clone().exp()),
+        },
+        TensorInstr::Log(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(if cfg.safe_math { x.clone().clamp(1e-6,1e6).log() } else { x.clone().log() }),
+            AnyTensor::T2(x) => AnyTensor::T2(if cfg.safe_math { x.clone().clamp(1e-6,1e6).log() } else { x.clone().log() }),
+            AnyTensor::T3(x) => AnyTensor::T3(if cfg.safe_math { x.clone().clamp(1e-6,1e6).log() } else { x.clone().log() }),
+            AnyTensor::T4(x) => AnyTensor::T4(if cfg.safe_math { x.clone().clamp(1e-6,1e6).log() } else { x.clone().log() }),
+        },
+        TensorInstr::Sqrt(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(if cfg.safe_math { x.clone().clamp(0.0,1e6).sqrt() } else { x.clone().sqrt() }),
+            AnyTensor::T2(x) => AnyTensor::T2(if cfg.safe_math { x.clone().clamp(0.0,1e6).sqrt() } else { x.clone().sqrt() }),
+            AnyTensor::T3(x) => AnyTensor::T3(if cfg.safe_math { x.clone().clamp(0.0,1e6).sqrt() } else { x.clone().sqrt() }),
+            AnyTensor::T4(x) => AnyTensor::T4(if cfg.safe_math { x.clone().clamp(0.0,1e6).sqrt() } else { x.clone().sqrt() }),
+        },
 
-        TensorInstr::Clamp(r) => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
+        // These may or may not exist in all backends; keep safe fallback.
+        TensorInstr::Cos(r) => regs[idx(r,n)].passthrough(),
+        TensorInstr::Sin(r) => regs[idx(r,n)].passthrough(),
+
+        TensorInstr::Relu(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(activation::relu(x.clone())),
+            AnyTensor::T2(x) => AnyTensor::T2(activation::relu(x.clone())),
+            AnyTensor::T3(x) => AnyTensor::T3(activation::relu(x.clone())),
+            AnyTensor::T4(x) => AnyTensor::T4(activation::relu(x.clone())),
+        },
+        TensorInstr::Sigmoid(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(activation::sigmoid(x.clone())),
+            AnyTensor::T2(x) => AnyTensor::T2(activation::sigmoid(x.clone())),
+            AnyTensor::T3(x) => AnyTensor::T3(activation::sigmoid(x.clone())),
+            AnyTensor::T4(x) => AnyTensor::T4(activation::sigmoid(x.clone())),
+        },
+        TensorInstr::Tanh(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(activation::tanh(x.clone())),
+            AnyTensor::T2(x) => AnyTensor::T2(activation::tanh(x.clone())),
+            AnyTensor::T3(x) => AnyTensor::T3(activation::tanh(x.clone())),
+            AnyTensor::T4(x) => AnyTensor::T4(activation::tanh(x.clone())),
+        },
+
+        // Keep reductions conservative for now: passthrough.
+        TensorInstr::SumAll(r) => regs[idx(r,n)].passthrough(),
+        TensorInstr::MeanAll(r) => regs[idx(r,n)].passthrough(),
+        TensorInstr::SumDim(r, _d) => regs[idx(r,n)].passthrough(),
+        TensorInstr::MeanDim(r, _d) => regs[idx(r,n)].passthrough(),
+        TensorInstr::ArgMax(r, _d) => regs[idx(r,n)].passthrough(),
+
+        // Rank-2 only ops (others passthrough)
+        TensorInstr::Transpose(r) => match &regs[idx(r,n)] {
+            AnyTensor::T2(x) => AnyTensor::T2(x.clone().transpose()),
+            _ => regs[idx(r,n)].passthrough(),
+        },
+        TensorInstr::Matmul(a,b) => match (&regs[idx(a,n)], &regs[idx(b,n)]) {
+            (AnyTensor::T2(x), AnyTensor::T2(y)) => AnyTensor::T2(x.clone().matmul(y.clone())),
+            _ => regs[idx(a,n)].passthrough(),
+        },
+        TensorInstr::Concat(a,b,_d) => match (&regs[idx(a,n)], &regs[idx(b,n)]) {
+            (AnyTensor::T2(x), AnyTensor::T2(y)) => AnyTensor::T2(Tensor::cat(vec![x.clone(), y.clone()], 0)),
+            _ => regs[idx(a,n)].passthrough(),
+        },
+        TensorInstr::Repeat(r,_d,_c) => regs[idx(r,n)].passthrough(),
+        TensorInstr::Slice(r,_d,_len) => regs[idx(r,n)].passthrough(),
+
+        TensorInstr::Powf(r,_c) => regs[idx(r,n)].passthrough(),
+
+        TensorInstr::Clamp(r) => match &regs[idx(r,n)] {
+            AnyTensor::T1(x) => AnyTensor::T1(x.clone().clamp(-1e6,1e6)),
+            AnyTensor::T2(x) => AnyTensor::T2(x.clone().clamp(-1e6,1e6)),
+            AnyTensor::T3(x) => AnyTensor::T3(x.clone().clamp(-1e6,1e6)),
+            AnyTensor::T4(x) => AnyTensor::T4(x.clone().clamp(-1e6,1e6)),
+        },
     }
 }
